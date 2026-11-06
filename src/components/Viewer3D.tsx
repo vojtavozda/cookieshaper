@@ -236,54 +236,6 @@ function disposeViewerObject(root: THREE.Object3D) {
   });
 }
 
-/** Built-in canvas capture — current camera/lights/SSAO, higher pixel ratio, no grid. */
-// Kept for when the preview-export button is re-enabled.
-function exportPreviewPng(ctx: SceneCtx) {
-  const { renderer, scene, composer, renderPass, ssaoPass, controls } = ctx;
-  const cam = ctx.orthographic ? ctx.ortho : ctx.persp;
-  controls.update();
-
-  const mount = renderer.domElement.parentElement;
-  if (!mount) return;
-  const w = mount.clientWidth;
-  const h = mount.clientHeight;
-  if (w < 2 || h < 2) return;
-
-  const prevPr = renderer.getPixelRatio();
-  const exportPr = Math.min(Math.max(window.devicePixelRatio, 2) * 1.5, 3);
-  renderer.setPixelRatio(exportPr);
-  renderer.setSize(w, h, false);
-  composer.setSize(w, h);
-  ssaoPass.setSize(w, h);
-
-  const hidden: THREE.Object3D[] = [];
-  scene.traverse((o) => {
-    if ((o as THREE.GridHelper).isGridHelper && o.visible) {
-      o.visible = false;
-      hidden.push(o);
-    }
-  });
-
-  renderPass.camera = cam;
-  ssaoPass.camera = cam;
-  if (ctx.ssao) composer.render();
-  else renderer.render(scene, cam);
-
-  // Sync read before the next animation frame overwrites the buffer
-  const dataUrl = renderer.domElement.toDataURL("image/png");
-
-  for (const o of hidden) o.visible = true;
-  renderer.setPixelRatio(prevPr);
-  renderer.setSize(w, h, false);
-  composer.setSize(w, h);
-  ssaoPass.setSize(w, h);
-
-  const a = document.createElement("a");
-  a.href = dataUrl;
-  a.download = "pernicek-preview.png";
-  a.click();
-}
-
 export function Viewer3D({ group }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<SceneCtx | null>(null);

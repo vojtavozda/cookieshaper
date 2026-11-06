@@ -286,6 +286,16 @@ function ensureSmoothFlags(meta: PathMeta) {
   meta.smooth.length = meta.path.segments.length;
 }
 
+/** Paper's ToolEvent carries the DOM event at runtime; typings omit it. */
+function toolDomEvent(e: paper.ToolEvent): MouseEvent | undefined {
+  return (e as paper.ToolEvent & { event?: MouseEvent }).event;
+}
+
+function toolCtrlOrMeta(e: paper.ToolEvent): boolean {
+  const native = toolDomEvent(e);
+  return !!(native?.ctrlKey || native?.metaKey || e.modifiers?.control || e.modifiers?.meta);
+}
+
 export function DrawCanvas({
   backgroundUrl,
   mode,
@@ -598,8 +608,6 @@ export function DrawCanvas({
       );
     };
 
-    const isFeature = (m: PathMeta) => m.role === "feature";
-
     const featureColor = (m: PathMeta) =>
       m.raised === false ? "#1e3a8a" : "#7f1d1d";
 
@@ -783,7 +791,7 @@ export function DrawCanvas({
       highlight.strokeColor = new scope.Color(stroke);
       highlight.strokeWidth = screen(2.2);
       highlight.fillColor = null;
-      highlight.dashArray = null;
+      highlight.dashArray = [];
       highlight.locked = true;
       scope.project.activeLayer.addChild(highlight);
       highlight.bringToFront();
@@ -3036,7 +3044,7 @@ export function DrawCanvas({
       if (modeRef.current === "edit") {
         const meta = selectedRef.current;
         // Double-click → curve-edit mode
-        if (e.event && (e.event as MouseEvent).detail === 2) {
+        if (toolDomEvent(e)?.detail === 2) {
           dragRef.current = null;
           let target = meta;
           if (!target) {
@@ -3256,22 +3264,14 @@ export function DrawCanvas({
           measureDrag.finishTo = null;
           measureAnchor = null;
           clearCurveHover();
-          const ctrl = !!(
-            (e.event as MouseEvent | undefined)?.ctrlKey ||
-            (e.event as MouseEvent | undefined)?.metaKey ||
-            e.modifiers?.control
-          );
+          const ctrl = toolCtrlOrMeta(e);
           updateMeasureDragVisual(measureDrag.start, e.point, ctrl);
         }
         return;
       }
 
       if (modeRef.current === "ellipse" && ellipseDrag) {
-        const ctrl = !!(
-          (e.event as MouseEvent | undefined)?.ctrlKey ||
-          (e.event as MouseEvent | undefined)?.metaKey ||
-          e.modifiers?.control
-        );
+        const ctrl = toolCtrlOrMeta(e);
         updateEllipsePath(ellipseDrag.from, maybeSnap(e.point), ctrl);
         return;
       }
@@ -3338,8 +3338,7 @@ export function DrawCanvas({
         // Avoid flipping through zero
         if (Math.abs(sx) < 0.05) sx = sx < 0 ? -0.05 : 0.05;
         if (Math.abs(sy) < 0.05) sy = sy < 0 ? -0.05 : 0.05;
-        const native = e.event as MouseEvent | undefined;
-        const ctrl = !!(native?.ctrlKey || native?.metaKey || e.modifiers?.control);
+        const ctrl = toolCtrlOrMeta(e);
         if (ctrl) {
           const len0 = Math.hypot(dx0, dy0) || 1;
           const s = Math.max(0.05, Math.hypot(dx1, dy1) / len0);
@@ -3359,11 +3358,7 @@ export function DrawCanvas({
         applyRaw(drag.meta.path, drag.startRaw, scope);
         for (const f of drag.linkedStarts) applyRaw(f.meta.path, f.raw, scope);
         let ang = e.point.subtract(drag.center).angle;
-        const ctrl = !!(
-          (e.event as MouseEvent | undefined)?.ctrlKey ||
-          (e.event as MouseEvent | undefined)?.metaKey ||
-          e.modifiers?.control
-        );
+        const ctrl = toolCtrlOrMeta(e);
         let delta = ang - drag.startAngle;
         if (ctrl) delta = Math.round(delta / 15) * 15;
         drag.meta.path.rotate(delta, drag.center);
@@ -3450,11 +3445,7 @@ export function DrawCanvas({
       if (modeRef.current === "ellipse" && ellipseDrag) {
         const dragE = ellipseDrag;
         ellipseDrag = null;
-        const ctrl = !!(
-          (e.event as MouseEvent | undefined)?.ctrlKey ||
-          (e.event as MouseEvent | undefined)?.metaKey ||
-          e.modifiers?.control
-        );
+        const ctrl = toolCtrlOrMeta(e);
         const path =
           dragE.path ??
           updateEllipsePath(dragE.from, maybeSnap(e.point), ctrl);
@@ -3488,11 +3479,7 @@ export function DrawCanvas({
         measureDrag = null;
 
         if (dragM.moved) {
-          const ctrl = !!(
-            (e.event as MouseEvent | undefined)?.ctrlKey ||
-            (e.event as MouseEvent | undefined)?.metaKey ||
-            e.modifiers?.control
-          );
+          const ctrl = toolCtrlOrMeta(e);
           const end = updateMeasureDragVisual(dragM.start, e.point, ctrl);
           const lengthPx = dragM.start.getDistance(end);
           if (lengthPx < 1e-3) {

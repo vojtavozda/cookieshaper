@@ -78,13 +78,13 @@ export function DownloadDialog({
             backdropFilter: "blur(6px)",
           },
         },
-      }}
-      PaperProps={{
-        sx: {
-          position: "relative",
-          borderRadius: 2,
-          px: { xs: 1, sm: 2 },
-          py: 1,
+        paper: {
+          sx: {
+            position: "relative",
+            borderRadius: 2,
+            px: { xs: 1, sm: 2 },
+            py: 1,
+          },
         },
       }}
     >

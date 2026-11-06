@@ -1,10 +1,8 @@
-import { useLayoutEffect, useState } from "react";
 import {
   Box,
   Button,
   Divider,
   FormControl,
-  FormControlLabel,
   IconButton,
   InputLabel,
   MenuItem,
@@ -17,88 +15,9 @@ import {
 import DownloadIcon from "@mui/icons-material/Download";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import { BUILD_METHODS, type BuildMethod, type CutterParams, type SizeReadout, type StampParams } from "../types";
-import {
-  loadBmcStyle,
-  saveBmcStyle,
-  type BmcStyle,
-} from "../storage";
 import { WheelSlider } from "./WheelSlider";
 
-const BMC_HREF = "https://www.buymeacoffee.com/vojtavozda";
-const BMC_IMG =
-  "https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=vojtavozda&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff";
-const BMC_SHOW_CLASS = "bmc-show-widget";
-
-function setBmcWidgetVisible(on: boolean) {
-  document.body.classList.toggle(BMC_SHOW_CLASS, on);
-}
-
-function BuyMeACoffeeButton() {
-  return (
-    <Box sx={{ display: "flex", justifyContent: "center", width: "100%" }}>
-      <Box
-        component="a"
-        href={BMC_HREF}
-        target="_blank"
-        rel="noopener noreferrer"
-        aria-label="Buy me a coffee"
-        sx={{
-          display: "inline-flex",
-          lineHeight: 0,
-          mx: "auto",
-          "& img": {
-            display: "block",
-            height: 40,
-            width: "auto",
-            maxWidth: "100%",
-          },
-        }}
-      >
-        <img src={BMC_IMG} alt="Buy me a coffee" />
-      </Box>
-    </Box>
-  );
-}
-
-function BuyMeACoffeeSection() {
-  const [style, setStyle] = useState<BmcStyle>(() => {
-    const initial = loadBmcStyle();
-    setBmcWidgetVisible(initial === "widget");
-    return initial;
-  });
-
-  useLayoutEffect(() => {
-    setBmcWidgetVisible(style === "widget");
-  }, [style]);
-
-  const setNext = (next: BmcStyle) => {
-    setStyle(next);
-    saveBmcStyle(next);
-  };
-
-  return (
-    <Stack spacing={1}>
-      {style === "button" ? <BuyMeACoffeeButton /> : null}
-      <FormControlLabel
-        sx={{
-          mx: 0,
-          justifyContent: "center",
-          gap: 0.5,
-          "& .MuiFormControlLabel-label": { fontSize: 12, color: "text.secondary" },
-        }}
-        control={
-          <Switch
-            size="small"
-            checked={style === "widget"}
-            onChange={(_, on) => setNext(on ? "widget" : "button")}
-            inputProps={{ "aria-label": "Floating Buy me a coffee widget" }}
-          />
-        }
-        label="Floating coffee widget"
-      />
-    </Stack>
-  );
-}
+/* Buy-me-a-coffee panel UI hidden for now — restore from git history when needed. */
 
 /** Kept for debugging alternate builders; users always get Clipper2. */
 const SHOW_BUILD_METHOD_UI = false;
@@ -479,7 +398,6 @@ export function ParamsPanel({
         >
           Download
         </Button>
-        {/* <BuyMeACoffeeSection /> */}
       </Box>
     </Box>
   );
