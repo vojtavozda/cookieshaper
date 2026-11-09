@@ -9,6 +9,8 @@ import StraightenIcon from "@mui/icons-material/Straighten";
 import GridOnIcon from "@mui/icons-material/GridOn";
 import UndoIcon from "@mui/icons-material/Undo";
 import RedoIcon from "@mui/icons-material/Redo";
+import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
+import { Broom } from "lucide-react";
 import { EditCurveIcon } from "./EditCurveIcon";
 
 /** Classic mouse-pointer arrow for object edit mode. */
@@ -53,10 +55,16 @@ type Props = {
   onOpenImagePanel: () => void;
   onDeleteCurrent: () => void;
   canDelete: boolean;
+  /** Remove every curve, stamp feature, and background image. */
+  onClearCanvas: () => void;
+  canClearCanvas: boolean;
   onUndo: () => void;
   onRedo: () => void;
   canUndo: boolean;
   canRedo: boolean;
+  /** Flush browser sketch draft (same as Ctrl+S). */
+  onSaveDraft: () => void;
+  canSaveDraft: boolean;
 };
 
 function RailSep() {
@@ -82,10 +90,14 @@ export function ToolRail({
   onOpenImagePanel,
   onDeleteCurrent,
   canDelete,
+  onClearCanvas,
+  canClearCanvas,
   onUndo,
   onRedo,
   canUndo,
   canRedo,
+  onSaveDraft,
+  canSaveDraft,
 }: Props) {
   return (
     <Box
@@ -140,7 +152,10 @@ export function ToolRail({
         </IconButton>
       </Tooltip>
 
-      <Tooltip title="Ellipse (drag; hold Ctrl for circle)" placement="right">
+      <Tooltip
+        title="Ellipse (drag; Ctrl = circle; Shift = from center)"
+        placement="right"
+      >
         <IconButton
           color={mode === "ellipse" ? "primary" : "default"}
           onClick={() => onModeChange("ellipse")}
@@ -204,6 +219,21 @@ export function ToolRail({
         </span>
       </Tooltip>
 
+      <Tooltip
+        title={
+          canClearCanvas
+            ? "Clear canvas — curves, stamps & background"
+            : "Canvas is empty"
+        }
+        placement="right"
+      >
+        <span>
+          <IconButton disabled={!canClearCanvas} onClick={onClearCanvas}>
+            <Broom size={24} strokeWidth={1.75} />
+          </IconButton>
+        </span>
+      </Tooltip>
+
       <RailSep />
 
       <Tooltip
@@ -228,6 +258,21 @@ export function ToolRail({
         </span>
       </Tooltip>
 
+      <Tooltip
+        title={
+          canSaveDraft
+            ? "Save sketch in this browser (Ctrl+S)"
+            : "Draw a curve to save"
+        }
+        placement="right"
+      >
+        <span>
+          <IconButton disabled={!canSaveDraft} onClick={onSaveDraft}>
+            <SaveOutlinedIcon />
+          </IconButton>
+        </span>
+      </Tooltip>
+
       {showSmooth && (
         <Box
           sx={{
@@ -236,15 +281,23 @@ export function ToolRail({
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
-            minHeight: 140,
+            minHeight: 160,
+            overflow: "visible",
           }}
         >
           <Typography
             variant="caption"
             color="text.secondary"
-            sx={{ mb: 1, writingMode: "vertical-rl", fontSize: 10 }}
+            sx={{ fontSize: 10, lineHeight: 1.2 }}
           >
             Smooth
+          </Typography>
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            sx={{ mb: 0.75, fontSize: 11, fontVariantNumeric: "tabular-nums" }}
+          >
+            {simplifyTolerance.toFixed(1)}
           </Typography>
           <WheelSlider
             orientation="vertical"
@@ -257,26 +310,14 @@ export function ToolRail({
               const el = e.target as HTMLElement | null;
               el?.blur?.();
             }}
-            valueLabelDisplay="auto"
+            // Value shown above the track — hover chip would cover the canvas
+            valueLabelDisplay="off"
             sx={{
               height: 120,
               py: 1,
               "& .MuiSlider-thumb": { width: 14, height: 14 },
-              "& .MuiSlider-valueLabel": {
-                left: "calc(100% + 12px)",
-                right: "auto",
-                top: "50%",
-                transform: "translate(0, -50%) scale(0)",
-                "&::before": { left: -4, right: "auto" },
-                "&.MuiSlider-valueLabelOpen": {
-                  transform: "translate(0, -50%) scale(1)",
-                },
-              },
             }}
           />
-          <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5 }}>
-            {simplifyTolerance.toFixed(1)}
-          </Typography>
         </Box>
       )}
     </Box>

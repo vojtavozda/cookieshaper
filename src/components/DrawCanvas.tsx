@@ -23,6 +23,7 @@ import SaveAltIcon from "@mui/icons-material/SaveAlt";
 import ApprovalOutlinedIcon from "@mui/icons-material/ApprovalOutlined";
 import type { Vec2 } from "../types";
 import type { CanvasMode } from "./ToolRail";
+import { ExamplesDialog } from "./ExamplesDialog";
 import { ImageTracePanel } from "./ImageTracePanel";
 import { WheelSlider } from "./WheelSlider";
 import {
@@ -39,9 +40,12 @@ import {
 } from "../geometry/pathEdit";
 import {
   findContours,
+  findStrokeCenterlines,
   loadImageData,
   prepareContourForEdit,
+  prepareOpenContourForEdit,
   type Contour,
+  type TraceMode,
 } from "../geometry/imageContours";
 import {
   classifyStampColor,
@@ -60,8 +64,16 @@ import {
   jpegFromImageUrl,
   type SketchPdfBackground,
 } from "../geometry/exportSketchPdf";
+import { ensureCcw } from "../geometry/offset";
 import { offsetClosedClipper } from "../geometry/stampGeom";
-import type { StampFeatureIn } from "../types";
+import {
+  clearSketchDraft,
+  loadSketchDraft,
+  saveSketchDraft,
+  type SketchDraftItem,
+} from "../geometry/sketchDraft";
+import type { StampFeatureIn, StampParams } from "../types";
+import { DEFAULT_STAMP } from "../types";
 
 const SNAP_SCREEN = 16;
 const NODE_SCREEN = 5;
@@ -90,6 +102,8 @@ type PathMeta = {
   raised?: boolean;
   widthMm?: number;
   filled?: boolean;
+  /** Special raised rim along the stamp plate edge (not in metasRef). */
+  stampRim?: boolean;
 };
 
 type OpenEnd = { meta: PathMeta; which: "first" | "last"; marker: paper.Item };
@@ -114,13 +128,15 @@ type DragEdit =
     }
   | { kind: "handle-in"; meta: PathMeta; index: number }
   | { kind: "handle-out"; meta: PathMeta; index: number }
-  | {
+      | {
       kind: "curve";
       meta: PathMeta;
       segIndex: number;
       t: number;
       last: paper.Point;
       started: boolean;
+      /** Straight span: place tangent handles along the chord, not the pull normal. */
+      bendStraight: boolean;
     }
   | {
       kind: "xform-move";
@@ -196,8 +212,18 @@ type Props = {
   wallThicknessMm: number;
   stampGapMm: number;
   onStampGapChange: (gapMm: number) => void;
+  /** Raised rim along the stamp plate edge (default on). */
+  stampOutlineEnabled: boolean;
+  onStampOutlineEnabledChange: (enabled: boolean) => void;
+  stampOutlineWidthMm: number;
+  onStampOutlineWidthChange: (widthMm: number) => void;
+  /** Full stamp params (for draft persistence). */
+  stamp: StampParams;
+  onStampChange: (next: StampParams) => void;
   /** Features of the cutter curve currently driving the 3D view; null = no stamp. */
   onStampFeatures: (features: StampFeatureIn[] | null) => void;
+  /** Short status after Ctrl+S draft flush. */
+  onDraftSaved?: (message: string) => void;
   /** Paper units → mm (always defined; from measure calibration or Size). */
   mmPerPx: number;
   onMmPerPxChange: (mmPerPx: number) => void;
@@ -217,6 +243,10 @@ type Props = {
   imagePanelToken: number;
   onImagePanelOpenChange: (open: boolean) => void;
   deleteToken: number;
+  /** Increment to wipe all curves, stamps, and the background. */
+  clearToken: number;
+  /** Called when clear-all should also drop the App background URL. */
+  onClearBackground: () => void;
   undoToken: number;
   redoToken: number;
   /** Whether the canvas has drawable curves (for Download dialog). */
@@ -230,6 +260,8 @@ type Props = {
 export type CanvasSaveApi = {
   savePdf: () => Promise<"saved" | "cancelled" | void>;
   buildPdfBytes: () => Promise<Uint8Array | null>;
+  /** Flush IndexedDB sketch draft (Ctrl+S / floppy). */
+  saveDraft: () => Promise<void>;
 };
 
 type MeasureEdit = {
@@ -252,7 +284,10 @@ type ScopeExtras = {
   __setFeatureRaised?: (raised: boolean) => void;
   __toggleFeatureFill?: () => void;
   __mirrorObject?: (axis: "h" | "v") => void;
+  /** Clipper2 outset/inset by a fixed mm amount (closed curves only). */
+  __offsetClosedByMm?: (mm: number) => void;
   __deleteCurrent?: () => void;
+  __clearCanvas?: () => void;
   __undo?: () => void;
   __redo?: () => void;
   __escape?: () => void;
@@ -267,6 +302,8 @@ type ScopeExtras = {
   __saveSketchPdf?: () => void | Promise<"saved" | "cancelled" | void>;
   /** Build sketch PDF bytes without downloading (for ZIP). */
   __buildSketchPdfBytes?: () => Promise<Uint8Array | null>;
+  __scheduleDraftSave?: () => void;
+  __flushDraftSave?: (toast?: boolean) => void;
 };
 
 function isTypingTarget(t: EventTarget | null) {
@@ -296,6 +333,11 @@ function toolCtrlOrMeta(e: paper.ToolEvent): boolean {
   return !!(native?.ctrlKey || native?.metaKey || e.modifiers?.control || e.modifiers?.meta);
 }
 
+function toolShift(e: paper.ToolEvent): boolean {
+  const native = toolDomEvent(e);
+  return !!(native?.shiftKey || e.modifiers?.shift);
+}
+
 export function DrawCanvas({
   backgroundUrl,
   mode,
@@ -305,7 +347,14 @@ export function DrawCanvas({
   wallThicknessMm,
   stampGapMm,
   onStampGapChange,
+  stampOutlineEnabled,
+  onStampOutlineEnabledChange,
+  stampOutlineWidthMm,
+  onStampOutlineWidthChange,
+  stamp,
+  onStampChange,
   onStampFeatures,
+  onDraftSaved,
   mmPerPx,
   onMmPerPxChange,
   onClosedPathChange,
@@ -316,9 +365,11 @@ export function DrawCanvas({
   onCurveClosed,
   onCurvesEmpty,
   onImportBackground,
+  onClearBackground,
   imagePanelToken,
   onImagePanelOpenChange,
   deleteToken,
+  clearToken,
   undoToken,
   redoToken,
   onHasCurvesChange,
@@ -336,14 +387,20 @@ export function DrawCanvas({
   const selectedRef = useRef<PathMeta | null>(null);
   const drawingRef = useRef<paper.Path | null>(null);
   const [canvasEmpty, setCanvasEmpty] = useState(true);
+  const [examplesOpen, setExamplesOpen] = useState(false);
   /** Finished curves on the canvas (enables Save). */
   const [hasCurves, setHasCurves] = useState(false);
   /** At least one closed outline — Save gets orange emphasis. */
   const [hasClosedCurve, setHasClosedCurve] = useState(false);
   const [traceOpen, setTraceOpen] = useState(false);
-  const [traceThreshold, setTraceThreshold] = useState(50);
+  // Higher = stricter: only darker ink (0 ≈ all, 255 = pure black only).
+  const [traceThreshold, setTraceThreshold] = useState(205);
   const [traceSmooth, setTraceSmooth] = useState(0.45);
   const [showBackground, setShowBackground] = useState(true);
+  /** Blue click-to-import contours over the background image. */
+  const [showTraceCurves, setShowTraceCurves] = useState(true);
+  /** Outlines of dark regions vs stroke centerlines. */
+  const [traceMode, setTraceMode] = useState<TraceMode>("outlines");
   /** Opacity while the background image is shown (default matches prior hard-coded 0.45). */
   const [bgOpacity, setBgOpacity] = useState(0.45);
   const [traceCurveCount, setTraceCurveCount] = useState(0);
@@ -396,10 +453,25 @@ export function DrawCanvas({
   gapMmRef.current = stampGapMm;
   const onStampGapChangeRef = useRef(onStampGapChange);
   onStampGapChangeRef.current = onStampGapChange;
+  const outlineEnabledRef = useRef(stampOutlineEnabled);
+  outlineEnabledRef.current = stampOutlineEnabled;
+  const onOutlineEnabledChangeRef = useRef(onStampOutlineEnabledChange);
+  onOutlineEnabledChangeRef.current = onStampOutlineEnabledChange;
+  const outlineWidthMmRef = useRef(stampOutlineWidthMm);
+  outlineWidthMmRef.current = stampOutlineWidthMm;
+  const onOutlineWidthChangeRef = useRef(onStampOutlineWidthChange);
+  onOutlineWidthChangeRef.current = onStampOutlineWidthChange;
+  const stampRef = useRef(stamp);
+  stampRef.current = stamp;
+  const onStampChangeRef = useRef(onStampChange);
+  onStampChangeRef.current = onStampChange;
   const onStampFeaturesRef = useRef(onStampFeatures);
   onStampFeaturesRef.current = onStampFeatures;
+  const onDraftSavedRef = useRef(onDraftSaved);
+  onDraftSavedRef.current = onDraftSaved;
   const [stampUi, setStampUi] = useState<"off" | "add" | "edit" | "back">("off");
   const [featureHud, setFeatureHud] = useState<{
+    rim?: boolean;
     widthMm: number;
     raised: boolean;
     filled: boolean;
@@ -413,6 +485,10 @@ export function DrawCanvas({
   mmPerPxRef.current = mmPerPx;
   const showBackgroundRef = useRef(showBackground);
   showBackgroundRef.current = showBackground;
+  const showTraceCurvesRef = useRef(showTraceCurves);
+  showTraceCurvesRef.current = showTraceCurves;
+  const traceModeRef = useRef(traceMode);
+  traceModeRef.current = traceMode;
   const bgOpacityRef = useRef(bgOpacity);
   bgOpacityRef.current = bgOpacity;
   const backgroundUrlRef = useRef(backgroundUrl);
@@ -430,7 +506,16 @@ export function DrawCanvas({
     scaleMmPerPx: number | null;
     imported?: ImportedPath[];
     stampGapMm?: number | null;
+    stampOutlineEnabled?: boolean | null;
+    stampOutlineWidthMm?: number | null;
   } | null>(null);
+  /** Draft restore waiting for background raster placement. */
+  const pendingDraftRestoreRef = useRef<{
+    items: SketchDraftItem[];
+    stampOwnerId: string | null;
+    mmPerPx: number | null;
+  } | null>(null);
+  const finishPendingDraftRestoreRef = useRef<(() => void) | null>(null);
   const finishPendingPdfImportRef = useRef<
     ((raster: paper.Raster | null) => void) | null
   >(null);
@@ -452,6 +537,8 @@ export function DrawCanvas({
   onCurvesEmptyRef.current = onCurvesEmpty;
   const onImportBgRef = useRef(onImportBackground);
   onImportBgRef.current = onImportBackground;
+  const onClearBackgroundRef = useRef(onClearBackground);
+  onClearBackgroundRef.current = onClearBackground;
   const onImagePanelOpenChangeRef = useRef(onImagePanelOpenChange);
   onImagePanelOpenChangeRef.current = onImagePanelOpenChange;
 
@@ -505,13 +592,20 @@ export function DrawCanvas({
 
     const rebuildImageContours = (threshold: number, smoothAmt: number) => {
       clearImageContours();
+      if (!showTraceCurvesRef.current) return 0;
       const img = imageDataRef.current;
       const sz = imageSizeRef.current;
       const raster = bgRef.current;
       if (!img || !sz || !raster || !raster.bounds) return 0;
-      const raw = findContours(img, threshold, { simplifyAmount: smoothAmt });
-      // Image-space: optional smooth + Douglas–Peucker (skipped at Simplify≈0)
-      const prepared = raw.map((c) => prepareContourForEdit(c, smoothAmt));
+      const lines = traceModeRef.current === "lines";
+      const raw = lines
+        ? findStrokeCenterlines(img, threshold, { simplifyAmount: smoothAmt })
+        : findContours(img, threshold, { simplifyAmount: smoothAmt });
+      const prepared = raw.map((c) =>
+        lines
+          ? prepareOpenContourForEdit(c, smoothAmt)
+          : prepareContourForEdit(c, smoothAmt),
+      );
       const b = raster.bounds;
       imageProjectContours = [];
       for (let i = 0; i < prepared.length; i++) {
@@ -519,24 +613,35 @@ export function DrawCanvas({
           x: b.left + (p.x / sz.w) * b.width,
           y: b.top + (p.y / sz.h) * b.height,
         }));
-        if (pts.length < 3) continue;
+        if (pts.length < (lines ? 2 : 3)) continue;
+        // Closed if first≈last after thinning (true loops); lines stay open
+        let closed = !lines;
+        if (lines && pts.length >= 3) {
+          const a = pts[0];
+          const b0 = pts[pts.length - 1];
+          if (Math.hypot(a.x - b0.x, a.y - b0.y) <= 1.5) {
+            pts.pop();
+            closed = true;
+          }
+        }
         const path = new scope.Path({
           segments: pts.map((p) => new scope.Point(p.x, p.y)),
-          closed: true,
+          closed,
           strokeColor: new scope.Color("#1e88e5"),
           strokeWidth: screen(1.5),
           fillColor: null,
           opacity: 0.75,
+          strokeCap: "round",
+          strokeJoin: "round",
         });
-        // Light Paper simplify only when the panel asks for more smoothing
         if (smoothAmt > 0.02) {
           path.simplify(0.5 + smoothAmt * 12);
         }
         path.data.imageContour = true;
         path.data.contourIndex = imagePreviewPaths.length;
+        path.data.traceOpen = !closed;
         path.bringToFront();
         imagePreviewPaths.push(path);
-        // Keep polyline snapshot of anchors (for fallback); path itself is source of truth
         imageProjectContours.push(
           path.segments.map((s) => ({ x: s.point.x, y: s.point.y })),
         );
@@ -557,14 +662,14 @@ export function DrawCanvas({
 
     const importImageContour = (index: number) => {
       const preview = imagePreviewPaths[index];
-      if (!preview || preview.segments.length < 3) return;
+      if (!preview || preview.segments.length < 2) return;
+      const asOpen = !!preview.data.traceOpen || !preview.closed;
+      if (!asOpen && preview.segments.length < 3) return;
       pushUndo();
       // Clone the already-simplified Bézier path (same as a freehand stroke)
       const path = preview.clone() as paper.Path;
       path.data = {};
-      path.closed = true;
-      path.strokeColor = new scope.Color("#c45c26");
-      path.strokeWidth = 2.2;
+      path.closed = !asOpen;
       path.strokeCap = "round";
       path.strokeJoin = "round";
       path.opacity = 1;
@@ -583,17 +688,29 @@ export function DrawCanvas({
       if (stampOwnerRef.current) {
         tagFeature(meta);
         syncStampChrome();
+      } else if (asOpen) {
+        path.strokeColor = new scope.Color("#111");
+        path.strokeWidth = 1.5;
+      } else {
+        path.strokeColor = new scope.Color("#c45c26");
+        path.strokeWidth = 2.2;
       }
       setSelection(meta, true);
       syncEmpty();
-      notifyClosedCurve();
+      if (!asOpen) notifyClosedCurve();
     };
 
     const stampOwnerRef: { current: PathMeta | null } = { current: null };
+    /** Outer fit-gap edge (mask hole; dashed chrome when rim is off). */
     const stampOutlineRef: { current: paper.Path | null } = { current: null };
+    /** Filled annulus matching 3D rim (outer − inward width). */
+    const stampRimFillRef: { current: paper.CompoundPath | null } = {
+      current: null,
+    };
+    const stampRimMetaRef: { current: PathMeta | null } = { current: null };
     const stampMaskRef: { current: paper.CompoundPath | null } = { current: null };
     let metaSeq = 1;
-    const lastWidthMm = { current: 1.2 };
+    const lastWidthMm = { current: 0.6 };
 
     const ensureId = (m: PathMeta) => {
       if (!m.id) m.id = `p${metaSeq++}`;
@@ -640,7 +757,9 @@ export function DrawCanvas({
         const lim = screen(14);
         let best: paper.Point | null = null;
         let bestD = lim;
-        const consider = (item: paper.Path | null | undefined) => {
+        const consider = (
+          item: paper.Path | paper.CompoundPath | null | undefined,
+        ) => {
           if (!item || !item.visible) return;
           const loc = item.getNearestLocation(pt);
           if (loc && loc.distance < bestD) {
@@ -648,7 +767,11 @@ export function DrawCanvas({
             best = loc.point;
           }
         };
-        consider(stampOutlineRef.current);
+        if (outlineEnabledRef.current && stampRimFillRef.current) {
+          consider(stampRimFillRef.current);
+        } else {
+          consider(stampOutlineRef.current);
+        }
         const owner = stampOwnerRef.current;
         if (owner) {
           for (const m of metasRef.current) {
@@ -786,6 +909,19 @@ export function DrawCanvas({
     /** Thin outline of an entire path (edit-mode hover to hint selection). */
     const showPathHover = (meta: PathMeta) => {
       clearCurveHover();
+      if (meta.stampRim && stampRimFillRef.current) {
+        const highlight = stampRimFillRef.current.clone({
+          insert: false,
+        }) as paper.CompoundPath;
+        highlight.fillColor = new scope.Color(0.12, 0.53, 0.9, 0.28);
+        highlight.strokeColor = new scope.Color("#1e88e5");
+        highlight.strokeWidth = screen(1.6);
+        highlight.locked = true;
+        scope.project.activeLayer.addChild(highlight);
+        highlight.bringToFront();
+        curveHoverRef.current = highlight;
+        return;
+      }
       const stroke = meta.path.closed ? "#1e88e5" : "#e53935";
       const highlight = meta.path.clone({ insert: false }) as paper.Path;
       highlight.strokeColor = new scope.Color(stroke);
@@ -815,6 +951,21 @@ export function DrawCanvas({
         if (!loc || loc.distance >= bestD) continue;
         bestD = loc.distance;
         best = m;
+      }
+      // Raised outline rim — filled annulus, clickable / not point-editable
+      if (owner && outlineEnabledRef.current && stampRimMetaRef.current) {
+        const rim = stampRimMetaRef.current;
+        const fill = stampRimFillRef.current;
+        if (fill) {
+          if (fill.contains(pt)) {
+            return rim;
+          }
+          const loc = fill.getNearestLocation(pt);
+          if (loc && loc.distance < bestD) {
+            bestD = loc.distance;
+            best = rim;
+          }
+        }
       }
       return best;
     };
@@ -991,10 +1142,16 @@ export function DrawCanvas({
     let measureDrag: MeasureDrag | null = null;
     /** First point of a two-click measure */
     let measureAnchor: paper.Point | null = null;
-    /** Ellipse / circle drag (corner→corner; Ctrl = circle). */
+    /**
+     * Ellipse / circle drag.
+     * Default: corner→corner. Ctrl = circle. Shift = pinned start is the center.
+     */
+    /** Segments that existed before this polygon stroke (0 for a new shape). */
+    let polyBaseCount = 0;
     let ellipseDrag: {
       from: paper.Point;
       path: paper.Path | null;
+      pin: paper.Item | null;
     } | null = null;
 
     const clearMeasureUi = () => {
@@ -1010,23 +1167,83 @@ export function DrawCanvas({
 
     const clearEllipseDrag = () => {
       if (ellipseDrag?.path) ellipseDrag.path.remove();
+      ellipseDrag?.pin?.remove();
       ellipseDrag = null;
+    };
+
+    const makeEllipsePin = (at: paper.Point) => {
+      const g = new scope.Group();
+      g.locked = true;
+      const arm = screen(9);
+      const color = new scope.Color("#1e88e5");
+      const sw = screen(1.8);
+      g.addChild(
+        new scope.Path.Line({
+          from: at.add(new scope.Point(-arm, 0)),
+          to: at.add(new scope.Point(arm, 0)),
+          strokeColor: color,
+          strokeWidth: sw,
+          strokeCap: "round",
+        }),
+      );
+      g.addChild(
+        new scope.Path.Line({
+          from: at.add(new scope.Point(0, -arm)),
+          to: at.add(new scope.Point(0, arm)),
+          strokeColor: color,
+          strokeWidth: sw,
+          strokeCap: "round",
+        }),
+      );
+      g.addChild(
+        new scope.Path.Circle({
+          center: at,
+          radius: screen(2.2),
+          fillColor: color,
+          strokeColor: null,
+        }),
+      );
+      return g;
     };
 
     const updateEllipsePath = (
       from: paper.Point,
       to: paper.Point,
       circle: boolean,
+      fromCenter: boolean,
     ): paper.Path => {
-      const rect = new scope.Rectangle(from, to);
-      let rx = Math.max(Math.abs(rect.width) / 2, 0.5);
-      let ry = Math.max(Math.abs(rect.height) / 2, 0.5);
-      if (circle) {
-        const r = Math.max(Math.min(rx, ry), 0.5);
-        rx = r;
-        ry = r;
+      const dx = to.x - from.x;
+      const dy = to.y - from.y;
+      let center: paper.Point;
+      let rx: number;
+      let ry: number;
+      if (fromCenter) {
+        // Pinned start is the center; cursor defines the radii
+        center = from;
+        if (circle) {
+          const r = Math.max(Math.hypot(dx, dy), 1);
+          rx = r;
+          ry = r;
+        } else {
+          rx = Math.max(Math.abs(dx), 1);
+          ry = Math.max(Math.abs(dy), 1);
+        }
+      } else {
+        // Corner→corner: keep the drag-start corner fixed. Ctrl (circle) must
+        // not re-center on the raw drag rect — that makes the shape jump.
+        const sx = dx >= 0 ? 1 : -1;
+        const sy = dy >= 0 ? 1 : -1;
+        let w = Math.max(Math.abs(dx), 1);
+        let h = Math.max(Math.abs(dy), 1);
+        if (circle) {
+          const s = Math.max(Math.min(w, h), 1);
+          w = s;
+          h = s;
+        }
+        rx = w / 2;
+        ry = h / 2;
+        center = new scope.Point(from.x + sx * rx, from.y + sy * ry);
       }
-      const center = rect.center;
       if (ellipseDrag?.path) {
         ellipseDrag.path.remove();
       }
@@ -1202,9 +1419,20 @@ export function DrawCanvas({
         });
       }
       const preview = polyPreviewRef.current;
+      preview.strokeWidth = screen(1.2);
+      preview.dashArray = [screen(5), screen(4)];
       preview.removeSegments();
-      preview.add(from);
-      preview.add(to);
+      const ho = poly.lastSegment.handleOut;
+      // One cubic so the dash stays visible. A polyline of short chords
+      // drops the dash, which hid the preview off a dragged first point.
+      if (ho.length > 0.5) {
+        preview.add(new scope.Segment(from, new scope.Point(0, 0), ho));
+        preview.add(new scope.Segment(to));
+      } else {
+        preview.add(from);
+        preview.add(to);
+      }
+      preview.bringToFront();
     };
 
     const clearGizmos = () => {
@@ -1243,7 +1471,11 @@ export function DrawCanvas({
     };
 
     const selectionPadBounds = (meta: PathMeta) => {
-      const b = meta.path.bounds.clone();
+      const src =
+        meta.stampRim && stampRimFillRef.current
+          ? stampRimFillRef.current
+          : meta.path;
+      const b = src.bounds.clone();
       const pad = screen(6);
       return new scope.Rectangle(
         b.x - pad,
@@ -1277,6 +1509,7 @@ export function DrawCanvas({
     };
 
     const hitXform = (pt: paper.Point, meta: PathMeta): XformHit | null => {
+      if (meta.stampRim) return null;
       const b = selectionPadBounds(meta);
       // Scale gets the near-corner zone; rotate sits further out so scale wins.
       const scaleR = screen(11);
@@ -1339,6 +1572,9 @@ export function DrawCanvas({
       box.locked = true;
       xformItemsRef.current.push(box);
 
+      // Outline rim: selection chrome only (no move/scale/rotate handles)
+      if (meta.stampRim) return;
+
       const cornerSize = screen(7);
       for (let i = 0; i < 4; i++) {
         const c = cornerOf(b, i);
@@ -1370,7 +1606,7 @@ export function DrawCanvas({
     const rebuildCurveEditGizmos = () => {
       clearGizmos();
       const meta = selectedRef.current;
-      if (!meta) return;
+      if (!meta || meta.stampRim) return;
       ensureSmoothFlags(meta);
       meta.path.fullySelected = false;
       meta.path.selected = false;
@@ -1562,6 +1798,92 @@ export function DrawCanvas({
       if (undoRef.current.length > 40) undoRef.current.shift();
       redoRef.current = [];
       notifyHistory();
+      scheduleDraftSave();
+    };
+
+    let draftSaveTimer: number | null = null;
+    let draftSavePending = false;
+    const draftRestoringRef = { current: false };
+
+    const collectDraftItems = (): SketchDraftItem[] =>
+      metasRef.current.map((m) => ({
+        raw: cloneRaw(m.path),
+        smooth: [...m.smooth],
+        closed: m.path.closed,
+        lockIndex: m.lockIndex,
+        simplifyTol: m.simplifyTol,
+        noSimplify: m.noSimplify,
+        id: m.id,
+        role: m.role,
+        stampId: m.stampId,
+        ownerId: m.ownerId,
+        raised: m.raised,
+        widthMm: m.widthMm,
+        filled: m.filled,
+      }));
+
+    const captureBackgroundBlob = async (): Promise<{
+      blob: Blob | null;
+      place: { x: number; y: number; width: number; height: number } | null;
+    }> => {
+      const url = backgroundUrlRef.current;
+      const raster = bgRef.current;
+      if (!url || !raster || raster.width <= 0) {
+        return { blob: null, place: null };
+      }
+      try {
+        const res = await fetch(url);
+        const blob = await res.blob();
+        const b = raster.bounds;
+        return {
+          blob,
+          place: { x: b.x, y: b.y, width: b.width, height: b.height },
+        };
+      } catch {
+        return { blob: null, place: null };
+      }
+    };
+
+    const flushDraftSave = async (opts?: { toast?: boolean }) => {
+      if (draftRestoringRef.current) return;
+      if (draftSaveTimer != null) {
+        window.clearTimeout(draftSaveTimer);
+        draftSaveTimer = null;
+      }
+      draftSavePending = false;
+      const items = collectDraftItems().filter((it) => it.raw.length >= 2);
+      if (!items.length) {
+        await clearSketchDraft();
+        return;
+      }
+      const bg = await captureBackgroundBlob();
+      try {
+        await saveSketchDraft({
+          items,
+          mmPerPx: mmPerPxRef.current > 0 ? mmPerPxRef.current : null,
+          stamp: stampRef.current ?? { ...DEFAULT_STAMP },
+          stampOwnerId: stampOwnerRef.current?.id ?? null,
+          bgPlace: bg.place,
+          background: bg.blob,
+        });
+        if (opts?.toast) {
+          onDraftSavedRef.current?.("Sketch saved in this browser");
+        }
+      } catch {
+        if (opts?.toast) {
+          onDraftSavedRef.current?.("Could not save sketch draft");
+        }
+      }
+    };
+
+    const scheduleDraftSave = () => {
+      if (draftRestoringRef.current) return;
+      draftSavePending = true;
+      if (draftSaveTimer != null) window.clearTimeout(draftSaveTimer);
+      draftSaveTimer = window.setTimeout(() => {
+        draftSaveTimer = null;
+        void flushDraftSave();
+      }, 700);
     };
 
     const restoreSnapshot = (snap: Snapshot) => {
@@ -1612,6 +1934,30 @@ export function DrawCanvas({
       onSimplifySyncRef.current?.(null);
       emitClosedNow();
       syncEmpty();
+      if (!draftRestoringRef.current) scheduleDraftSave();
+    };
+
+    const applyDraftItems = (
+      items: SketchDraftItem[],
+      stampOwnerId: string | null,
+    ) => {
+      restoreSnapshot({ items });
+      if (stampOwnerId) {
+        const owner =
+          metasRef.current.find((m) => m.id === stampOwnerId) ?? null;
+        if (owner?.path.closed) {
+          stampOwnerRef.current = owner;
+          syncStampChrome();
+          setSelection(null, true);
+        }
+      } else {
+        const preferClosed =
+          metasRef.current.find((m) => m.role !== "feature" && m.path.closed) ??
+          metasRef.current[metasRef.current.length - 1] ??
+          null;
+        if (preferClosed) setSelection(preferClosed, true);
+      }
+      if (metasRef.current.some((m) => m.path.closed)) notifyClosedCurve();
     };
 
     let emitTimer: number | null = null;
@@ -1658,23 +2004,67 @@ export function DrawCanvas({
           closed: m.path.closed,
           filled: !!m.filled,
           raised: m.raised !== false,
-          widthMm: m.widthMm ?? 1.2,
+          widthMm: m.widthMm ?? 0.6,
         }));
       onStampFeaturesRef.current(features);
     };
 
     const clearStampChrome = () => {
+      if (selectedRef.current?.stampRim) {
+        selectedRef.current = null;
+        onHasSelRef.current(false);
+        onSimplifySyncRef.current?.(null);
+        clearXformGizmos();
+      }
       stampOutlineRef.current?.remove();
       stampOutlineRef.current = null;
+      stampRimFillRef.current?.remove();
+      stampRimFillRef.current = null;
+      stampRimMetaRef.current = null;
       stampMaskRef.current?.remove();
       stampMaskRef.current = null;
     };
 
+    const ensureStampRimMeta = (path: paper.Path): PathMeta => {
+      let m = stampRimMetaRef.current;
+      if (!m) {
+        m = {
+          path,
+          raw: [],
+          smooth: [],
+          lockIndex: 0,
+          noSimplify: true,
+          role: "feature",
+          stampRim: true,
+          raised: true,
+          filled: true,
+          widthMm: outlineWidthMmRef.current,
+        };
+        stampRimMetaRef.current = m;
+      } else {
+        m.path = path;
+        m.widthMm = outlineWidthMmRef.current;
+        m.filled = true;
+      }
+      return m;
+    };
+
     const rebuildStampOutline = () => {
+      const keepRim = !!selectedRef.current?.stampRim;
       stampOutlineRef.current?.remove();
       stampOutlineRef.current = null;
+      stampRimFillRef.current?.remove();
+      stampRimFillRef.current = null;
       const owner = stampOwnerRef.current;
-      if (!owner || owner.path.segments.length < 3 || !owner.path.closed) return;
+      if (!owner || owner.path.segments.length < 3 || !owner.path.closed) {
+        stampRimMetaRef.current = null;
+        if (keepRim) {
+          selectedRef.current = null;
+          onHasSelRef.current(false);
+          onSimplifySyncRef.current?.(null);
+        }
+        return;
+      }
       const pts = samplePathPoints(owner.path, {
         flatness: 0.4,
         minPerCurve: 12,
@@ -1683,19 +2073,83 @@ export function DrawCanvas({
       const mm = mmPerPxRef.current > 1e-9 ? mmPerPxRef.current : 1;
       const insetPx = (wallMmRef.current / 2 + Math.max(0, gapMmRef.current)) / mm;
       const loop = offsetClosedClipper(pts, -insetPx);
-      if (!loop || loop.length < 3) return;
+      if (!loop || loop.length < 3) {
+        stampRimMetaRef.current = null;
+        if (keepRim) {
+          selectedRef.current = null;
+          onHasSelRef.current(false);
+          onSimplifySyncRef.current?.(null);
+        }
+        return;
+      }
+      // Outer plate edge — always kept for the mask hole
       const path = new scope.Path({
         closed: true,
-        strokeColor: new scope.Color("#455a64"),
-        strokeWidth: screen(1.4),
-        dashArray: [screen(6), screen(4)],
         fillColor: null,
-        locked: true,
       });
       for (const p of loop) path.add(new scope.Point(p.x, p.y));
       path.closed = true;
       path.data = { kind: "stamp-outline" };
+
+      if (outlineEnabledRef.current) {
+        const wPx = Math.max(0.05, outlineWidthMmRef.current) / mm;
+        const innerLoop = offsetClosedClipper(loop, -wPx);
+        if (innerLoop && innerLoop.length >= 3) {
+          // Keep edge path in the scene (mask hole needs a visible child);
+          // no stroke — the filled annulus is the visual.
+          path.strokeColor = null;
+          path.strokeWidth = 0;
+          path.fillColor = null;
+          path.visible = true;
+          path.locked = true;
+
+          const outer = new scope.Path({ insert: false, closed: true });
+          for (const p of loop) outer.add(new scope.Point(p.x, p.y));
+          outer.closed = true;
+          outer.clockwise = true;
+
+          const hole = new scope.Path({ insert: false, closed: true });
+          for (const p of innerLoop) hole.add(new scope.Point(p.x, p.y));
+          hole.closed = true;
+          hole.clockwise = false;
+
+          const fill = new scope.CompoundPath({
+            children: [outer, hole],
+            fillColor: new scope.Color("#7f1d1d"),
+            strokeColor: null,
+            strokeWidth: 0,
+            opacity: 0.92,
+            locked: false,
+          });
+          fill.data = { kind: "stamp-rim" };
+          stampRimFillRef.current = fill;
+        } else {
+          // Too narrow to inset — fall back to a thin edge mark
+          path.strokeColor = new scope.Color("#7f1d1d");
+          path.strokeWidth = screen(1.6);
+          path.dashArray = [];
+          path.visible = true;
+          path.locked = false;
+        }
+      } else {
+        path.strokeColor = new scope.Color("#455a64");
+        path.strokeWidth = screen(1.4);
+        path.dashArray = [screen(6), screen(4)];
+        path.visible = true;
+        path.locked = true;
+      }
+
       stampOutlineRef.current = path;
+      const rim = ensureStampRimMeta(path);
+      if (keepRim) {
+        if (outlineEnabledRef.current) {
+          selectedRef.current = rim;
+        } else {
+          selectedRef.current = null;
+          onHasSelRef.current(false);
+          onSimplifySyncRef.current?.(null);
+        }
+      }
     };
 
     const rebuildStampMask = () => {
@@ -1706,6 +2160,12 @@ export function DrawCanvas({
       const b = scope.view.bounds.expand(400);
       const frame = new scope.Path.Rectangle(b);
       const hole = outline.clone({ insert: false }) as paper.Path;
+      // Clone keeps stroke/visibility from the edge path; force a clean hole punch
+      hole.visible = true;
+      hole.strokeColor = null;
+      hole.strokeWidth = 0;
+      hole.fillColor = null;
+      hole.dashArray = [];
       frame.clockwise = true;
       hole.clockwise = false;
       const mask = new scope.CompoundPath({
@@ -1746,9 +2206,17 @@ export function DrawCanvas({
 
     const refreshFeatureHud = () => {
       const sel = selectedRef.current;
-      if (stampOwnerRef.current && sel && sel.role === "feature") {
+      if (stampOwnerRef.current && sel?.stampRim) {
         setFeatureHudRef.current({
-          widthMm: sel.widthMm ?? 1.2,
+          rim: true,
+          widthMm: outlineWidthMmRef.current,
+          raised: true,
+          filled: false,
+          closed: true,
+        });
+      } else if (stampOwnerRef.current && sel && sel.role === "feature") {
+        setFeatureHudRef.current({
+          widthMm: sel.widthMm ?? 0.6,
           raised: sel.raised !== false,
           filled: !!sel.filled,
           closed: sel.path.closed,
@@ -1815,6 +2283,7 @@ export function DrawCanvas({
         }
         owner.path.bringToFront();
         outline?.bringToFront();
+        stampRimFillRef.current?.bringToFront();
       } else {
         clearStampChrome();
         // Gray features under their cutters
@@ -1824,6 +2293,8 @@ export function DrawCanvas({
       }
       refreshStampUi();
       refreshFeatureHud();
+      // Outline path is rebuilt on sync — refresh selection chrome
+      rebuildEditGizmos();
     };
 
     const tagFeature = (meta: PathMeta) => {
@@ -1868,6 +2339,10 @@ export function DrawCanvas({
         m.path.fullySelected = false;
         m.path.selected = false;
       }
+      if (stampRimMetaRef.current) {
+        stampRimMetaRef.current.path.fullySelected = false;
+        stampRimMetaRef.current.path.selected = false;
+      }
       if (
         selectedSegmentRef.current &&
         selectedSegmentRef.current.meta !== meta
@@ -1880,7 +2355,9 @@ export function DrawCanvas({
       selectedRef.current = meta;
       onHasSelRef.current(!!meta);
       onSimplifySyncRef.current?.(
-        meta && !meta.noSimplify ? (meta.simplifyTol ?? 1) : null,
+        meta && !meta.noSimplify && !meta.stampRim
+          ? (meta.simplifyTol ?? 1)
+          : null,
       );
       rebuildEditGizmos();
       rebuildMeasureDots();
@@ -1927,6 +2404,8 @@ export function DrawCanvas({
     extras.__deleteCurrent = () => {
       const meta = selectedRef.current;
       if (!meta) return;
+      // Outline rim is toggled off — not deleted
+      if (meta.stampRim) return;
       // Never delete the locked cutter while editing its stamp
       if (stampOwnerRef.current && meta.role !== "feature") return;
       pushUndo();
@@ -1957,6 +2436,58 @@ export function DrawCanvas({
       syncStampChrome();
       setSelection(next, true);
       notifyMaybeEmpty();
+    };
+
+    extras.__clearCanvas = () => {
+      const hadPaths = metasRef.current.length > 0;
+      const hadBg = !!bgRef.current || !!backgroundUrlRef.current;
+      const hadDraft =
+        hadPaths ||
+        !!drawingRef.current ||
+        !!polygonRef.current ||
+        !!ellipseDrag;
+      if (!hadPaths && !hadBg && !hadDraft) return;
+      if (hadPaths) pushUndo();
+
+      drawingRef.current?.remove();
+      drawingRef.current = null;
+      if (polygonRef.current && !metasRef.current.some((m) => m.path === polygonRef.current)) {
+        polygonRef.current.remove();
+      }
+      polygonRef.current = null;
+      clearPolyPreview();
+      clearEllipseDrag();
+      clearMeasureUi();
+      clearImageContours();
+      clearDrawMarkers();
+      clearCurveHover();
+      clearAddPointMark();
+      selectedSegmentRef.current = null;
+      selectedPointRef.current = null;
+      continueMetaRef.current = null;
+
+      stampOwnerRef.current = null;
+      clearStampChrome();
+      for (const m of metasRef.current) m.path.remove();
+      metasRef.current = [];
+
+      selectedRef.current = null;
+      onHasSelRef.current(false);
+      onSimplifySyncRef.current?.(null);
+      clearGizmos();
+      clearXformGizmos();
+      rebuildEditGizmos();
+      refreshFeatureHud();
+      refreshStampUi();
+      syncEmpty();
+      onClosedRef.current(null);
+      onStampFeaturesRef.current(null);
+      onCurvesEmptyRef.current();
+      onClearBackgroundRef.current();
+      setTraceOpen(false);
+      onImagePanelOpenChangeRef.current(false);
+      void clearSketchDraft();
+      notifyHistory();
     };
 
     extras.__undo = () => {
@@ -2526,12 +3057,9 @@ export function DrawCanvas({
       path.strokeWidth = closed ? 2.2 : 1.5;
       path.fullySelected = false;
       path.selected = false;
-      // Clear any drag-created handles on open finish so it stays polygonal
-      if (!closed) {
-        for (const seg of path.segments) makeSegmentCorner(seg, scope);
-      }
+      // Click+drag points keep their smooth handles; plain clicks stay corners
       const raw = cloneRaw(path);
-      const smooth = path.segments.map(() => false);
+      const smooth = detectSmoothFlags(path);
       let meta: PathMeta;
       if (existing) {
         existing.raw = raw;
@@ -2609,12 +3137,8 @@ export function DrawCanvas({
         join.point.clone(),
       );
 
-      // Bake corners for open polygonal result; closed keeps join handles cleared below
-      if (!meta.path.closed) {
-        for (const seg of meta.path.segments) makeSegmentCorner(seg, scope);
-      }
       meta.raw = cloneRaw(meta.path);
-      meta.smooth = meta.path.segments.map(() => false);
+      meta.smooth = detectSmoothFlags(meta.path);
       if (stampOwnerRef.current || meta.role === "feature") {
         tagFeature(meta);
       } else {
@@ -2979,7 +3503,12 @@ export function DrawCanvas({
 
       if (modeRef.current === "ellipse") {
         clearEllipseDrag();
-        ellipseDrag = { from: maybeSnap(e.point), path: null };
+        const from = maybeSnap(e.point);
+        ellipseDrag = {
+          from,
+          path: null,
+          pin: makeEllipsePin(from),
+        };
         return;
       }
 
@@ -2998,6 +3527,7 @@ export function DrawCanvas({
             }
             meta.raw = cloneRaw(meta.path);
             polygonRef.current = meta.path;
+            polyBaseCount = meta.path.segments.length;
             polyHandleDragRef.current = {
               index: meta.path.segments.length - 1,
             };
@@ -3014,6 +3544,7 @@ export function DrawCanvas({
             fullySelected: false,
             selected: false,
           });
+          polyBaseCount = 0;
           polyHandleDragRef.current = { index: 0 };
           clearPolyPreview();
           syncEmpty();
@@ -3058,7 +3589,8 @@ export function DrawCanvas({
           }
           if (target) {
             setSelection(target, true);
-            onModeChangeRef.current("curveEdit");
+            // Outline rim is width-only — no point editing
+            if (!target.stampRim) onModeChangeRef.current("curveEdit");
           }
           return;
         }
@@ -3186,6 +3718,7 @@ export function DrawCanvas({
               t: ch.t,
               last: e.point.clone(),
               started: false,
+              bendStraight: false,
             };
             return;
           }
@@ -3272,7 +3805,13 @@ export function DrawCanvas({
 
       if (modeRef.current === "ellipse" && ellipseDrag) {
         const ctrl = toolCtrlOrMeta(e);
-        updateEllipsePath(ellipseDrag.from, maybeSnap(e.point), ctrl);
+        const fromCenter = toolShift(e) || shiftRef.current;
+        updateEllipsePath(
+          ellipseDrag.from,
+          maybeSnap(e.point),
+          ctrl,
+          fromCenter,
+        );
         return;
       }
 
@@ -3286,7 +3825,7 @@ export function DrawCanvas({
             seg.handleIn = delta.multiply(-1);
           }
         }
-        clearPolyPreview();
+        updatePolyPreview(e.point);
         return;
       }
 
@@ -3421,19 +3960,35 @@ export function DrawCanvas({
         return;
       }
       if (drag.kind === "curve") {
+        const segs = drag.meta.path.segments;
+        const a = segs[drag.segIndex];
+        const b = segs[(drag.segIndex + 1) % segs.length];
+        if (!a || !b) return;
         if (!drag.started) {
           if (e.point.getDistance(drag.last) < screen(3)) return;
           pushUndo();
           drag.started = true;
+          drag.bendStraight =
+            a.handleOut.length < 0.5 && b.handleIn.length < 0.5;
           selectedSegmentRef.current = null;
         }
-        const delta = e.point.subtract(drag.last);
-        drag.last = e.point.clone();
-        const segs = drag.meta.path.segments;
-        const a = segs[drag.segIndex];
-        const b = segs[(drag.segIndex + 1) % segs.length];
-        a.handleOut = a.handleOut.add(delta.multiply(1 - drag.t));
-        b.handleIn = b.handleIn.add(delta.multiply(drag.t));
+        if (drag.bendStraight) {
+          // Handles stay along the chord (tangent), plus the bulge needed to
+          // pass through the pointer. Pulling a line used to grow handles
+          // straight out along the normal, which then needed a second edit.
+          const t = Math.min(0.85, Math.max(0.15, drag.t));
+          const chord = b.point.subtract(a.point);
+          const onChord = a.point.add(chord.multiply(t));
+          const denom = 3 * (1 - t) * t;
+          const bulge = e.point.subtract(onChord).divide(denom);
+          a.handleOut = chord.multiply(1 / 3).add(bulge);
+          b.handleIn = chord.multiply(-1 / 3).add(bulge);
+        } else {
+          const delta = e.point.subtract(drag.last);
+          drag.last = e.point.clone();
+          a.handleOut = a.handleOut.add(delta.multiply(1 - drag.t));
+          b.handleIn = b.handleIn.add(delta.multiply(drag.t));
+        }
         rebuildEditGizmos();
         showCurveHover(drag.meta, drag.segIndex);
       }
@@ -3445,10 +4000,16 @@ export function DrawCanvas({
       if (modeRef.current === "ellipse" && ellipseDrag) {
         const dragE = ellipseDrag;
         ellipseDrag = null;
+        dragE.path?.remove();
+        dragE.pin?.remove();
         const ctrl = toolCtrlOrMeta(e);
-        const path =
-          dragE.path ??
-          updateEllipsePath(dragE.from, maybeSnap(e.point), ctrl);
+        const fromCenter = toolShift(e) || shiftRef.current;
+        const path = updateEllipsePath(
+          dragE.from,
+          maybeSnap(e.point),
+          ctrl,
+          fromCenter,
+        );
         const rx = path.bounds.width / 2;
         const ry = path.bounds.height / 2;
         if (rx < screen(2) && ry < screen(2)) {
@@ -3736,13 +4297,38 @@ export function DrawCanvas({
         ev.preventDefault();
       }
       if ((ev.key === "z" || ev.key === "Z") && (ev.ctrlKey || ev.metaKey)) {
-        if (ev.shiftKey) extras.__redo?.();
+        if (
+          !ev.shiftKey &&
+          modeRef.current === "polygon" &&
+          polygonRef.current
+        ) {
+          const poly = polygonRef.current;
+          if (poly.segments.length > polyBaseCount) {
+            poly.removeSegment(poly.segments.length - 1);
+            const meta = metasRef.current.find((m) => m.path === poly);
+            if (meta) meta.smooth = detectSmoothFlags(poly);
+          }
+          polyHandleDragRef.current = null;
+          if (poly.segments.length <= polyBaseCount) {
+            if (polyBaseCount === 0) poly.remove();
+            polygonRef.current = null;
+          }
+          clearPolyPreview();
+          clearMagnet();
+          clearSnapPreview();
+          refreshDrawMarkers();
+          syncEmpty();
+        } else if (ev.shiftKey) extras.__redo?.();
         else extras.__undo?.();
         ev.preventDefault();
       }
       if ((ev.key === "y" || ev.key === "Y") && (ev.ctrlKey || ev.metaKey)) {
         extras.__redo?.();
         ev.preventDefault();
+      }
+      if ((ev.key === "s" || ev.key === "S") && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        void flushDraftSave({ toast: true });
       }
       if (
         (ev.key === "Delete" || ev.key === "Backspace") &&
@@ -3868,8 +4454,33 @@ export function DrawCanvas({
     extras.__setFeatureWidth = (widthMm: number) => {
       const m = selectedRef.current;
       if (!m || m.role !== "feature") return;
-      m.widthMm = widthMm;
-      lastWidthMm.current = widthMm;
+      const w = Math.max(0.3, widthMm);
+      if (m.stampRim) {
+        m.widthMm = w;
+        onOutlineWidthChangeRef.current(w);
+        rebuildStampOutline();
+        rebuildStampMask();
+        const mask = stampMaskRef.current;
+        if (mask) {
+          for (const f of metasRef.current) {
+            if (
+              f.role === "feature" &&
+              f.ownerId === stampOwnerRef.current?.id
+            ) {
+              f.path.insertBelow(mask);
+            }
+          }
+          mask.sendToBack();
+        }
+        stampOwnerRef.current?.path.bringToFront();
+        stampOutlineRef.current?.bringToFront();
+        stampRimFillRef.current?.bringToFront();
+        refreshFeatureHud();
+        rebuildEditGizmos();
+        return;
+      }
+      m.widthMm = w;
+      lastWidthMm.current = w;
       styleFeature(m);
       refreshFeatureHud();
       emitClosed(true);
@@ -3877,7 +4488,7 @@ export function DrawCanvas({
 
     extras.__setFeatureRaised = (raised: boolean) => {
       const m = selectedRef.current;
-      if (!m || m.role !== "feature") return;
+      if (!m || m.role !== "feature" || m.stampRim) return;
       m.raised = raised;
       styleFeature(m);
       syncStampChrome();
@@ -3887,7 +4498,7 @@ export function DrawCanvas({
 
     extras.__toggleFeatureFill = () => {
       const m = selectedRef.current;
-      if (!m || m.role !== "feature" || !m.path.closed) return;
+      if (!m || m.role !== "feature" || m.stampRim || !m.path.closed) return;
       pushUndo();
       m.filled = !m.filled;
       styleFeature(m);
@@ -3898,7 +4509,7 @@ export function DrawCanvas({
 
     extras.__mirrorObject = (axis: "h" | "v") => {
       const meta = selectedRef.current;
-      if (!meta) return;
+      if (!meta || meta.stampRim) return;
       pushUndo();
       const center = meta.path.bounds.center.clone();
       // h = flip across vertical axis (negate X); v = flip across horizontal (negate Y)
@@ -3914,6 +4525,40 @@ export function DrawCanvas({
           f.smooth = detectSmoothFlags(f.path);
         }
       }
+      syncStampChrome();
+      setSelection(meta, true);
+    };
+
+    /** Grow (positive mm) or shrink (negative) via Clipper2 — not a scale. */
+    extras.__offsetClosedByMm = (mm: number) => {
+      const meta = selectedRef.current;
+      if (
+        !meta ||
+        meta.stampRim ||
+        !meta.path.closed ||
+        meta.path.segments.length < 3 ||
+        Math.abs(mm) < 1e-9
+      ) {
+        return;
+      }
+      const scale = mmPerPxRef.current > 1e-9 ? mmPerPxRef.current : 1;
+      const pts = ensureCcw(
+        samplePathPoints(meta.path, {
+          flatness: 0.4,
+          minPerCurve: 12,
+          maxPoints: 360,
+        }),
+      );
+      const loop = offsetClosedClipper(pts, mm / scale);
+      if (!loop || loop.length < 3) return;
+      pushUndo();
+      meta.path.removeSegments();
+      for (const p of loop) meta.path.add(new scope.Point(p.x, p.y));
+      meta.path.closed = true;
+      meta.raw = cloneRaw(meta.path);
+      // Offset yields a polyline — treat every vertex as a corner
+      meta.smooth = meta.path.segments.map(() => false);
+      if (meta.role === "feature") styleFeature(meta);
       syncStampChrome();
       setSelection(meta, true);
     };
@@ -4082,7 +4727,7 @@ export function DrawCanvas({
           meta.role = "feature";
           meta.raised = cls.raised;
           meta.filled = !!src?.filled;
-          meta.widthMm = src?.widthMm ?? 1.2;
+          meta.widthMm = src?.widthMm ?? 0.6;
           styleFeature(meta);
         } else {
           path.strokeColor = new scope.Color(path.closed ? "#c45c26" : "#111");
@@ -4139,12 +4784,33 @@ export function DrawCanvas({
       if (pending.stampGapMm != null) {
         onStampGapChangeRef.current(pending.stampGapMm);
       }
+      if (pending.stampOutlineEnabled != null) {
+        onOutlineEnabledChangeRef.current(pending.stampOutlineEnabled);
+      }
+      if (pending.stampOutlineWidthMm != null) {
+        onOutlineWidthChangeRef.current(pending.stampOutlineWidthMm);
+      }
       commitImportedPaths(
         pending.paths,
         pending.scaleMmPerPx,
         raster,
         pending.imported,
       );
+    };
+
+    finishPendingDraftRestoreRef.current = () => {
+      const pending = pendingDraftRestoreRef.current;
+      if (!pending) return;
+      pendingDraftRestoreRef.current = null;
+      applyDraftItems(pending.items, pending.stampOwnerId);
+      draftRestoringRef.current = false;
+      onDraftSavedRef.current?.("Restored sketch from this browser");
+      void flushDraftSave();
+    };
+
+    extras.__scheduleDraftSave = scheduleDraftSave;
+    extras.__flushDraftSave = (toast) => {
+      void flushDraftSave({ toast: !!toast });
     };
 
     const pathsFromImported = (
@@ -4189,7 +4855,7 @@ export function DrawCanvas({
             role: "feature",
             raised,
             filled: !!m.filled,
-            widthMm: m.widthMm ?? 1.2,
+            widthMm: m.widthMm ?? 0.6,
             strokeRgb: raised ? STAMP_RAISE_RGB : STAMP_RECESS_RGB,
           });
         } else {
@@ -4241,6 +4907,8 @@ export function DrawCanvas({
         mmPerPx: mmPerPxRef.current,
         background: payload.background,
         stampGapMm: gapMmRef.current,
+        stampOutlineEnabled: outlineEnabledRef.current,
+        stampOutlineWidthMm: outlineWidthMmRef.current,
       });
     };
 
@@ -4250,10 +4918,13 @@ export function DrawCanvas({
         window.alert("Nothing to save — draw or import a curve first.");
         return;
       }
+      void flushDraftSave();
       return downloadSketchPdf(payload.paths, "pernicek.pdf", {
         mmPerPx: mmPerPxRef.current,
         background: payload.background,
         stampGapMm: gapMmRef.current,
+        stampOutlineEnabled: outlineEnabledRef.current,
+        stampOutlineWidthMm: outlineWidthMmRef.current,
       });
     };
 
@@ -4297,10 +4968,18 @@ export function DrawCanvas({
             mmPerPx: scale,
             background,
             stampGapMm,
+            stampOutlineEnabled,
+            stampOutlineWidthMm,
           } = await pathsFromPdfFile(file);
           const { paths, kept } = pathsFromImported(imported);
           if (!paths.length) throw new Error("No vector paths found in PDF");
           if (stampGapMm != null) onStampGapChangeRef.current(stampGapMm);
+          if (stampOutlineEnabled != null) {
+            onOutlineEnabledChangeRef.current(stampOutlineEnabled);
+          }
+          if (stampOutlineWidthMm != null) {
+            onOutlineWidthChangeRef.current(stampOutlineWidthMm);
+          }
           if (background?.jpeg.length) {
             const blobUrl = URL.createObjectURL(
               new Blob([background.jpeg], { type: "image/jpeg" }),
@@ -4315,6 +4994,8 @@ export function DrawCanvas({
               scaleMmPerPx: scale,
               imported: kept,
               stampGapMm,
+              stampOutlineEnabled,
+              stampOutlineWidthMm,
             };
             onImportBgRef.current(blobUrl);
             // commitImportedPaths runs from raster.onLoad once the image is placed
@@ -4344,6 +5025,47 @@ export function DrawCanvas({
     window.addEventListener("mouseup", onNativeUp);
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+    const onPageHide = () => {
+      if (draftSavePending || metasRef.current.length > 0) {
+        void flushDraftSave();
+      }
+    };
+    const onVisChange = () => {
+      if (document.visibilityState === "hidden") onPageHide();
+    };
+    window.addEventListener("pagehide", onPageHide);
+    document.addEventListener("visibilitychange", onVisChange);
+
+    // Restore last sketch from IndexedDB (paths + optional background)
+    draftRestoringRef.current = true;
+    void (async () => {
+      try {
+        const draft = await loadSketchDraft();
+        if (!draft || scopeRef.current !== scope) {
+          draftRestoringRef.current = false;
+          return;
+        }
+        const { meta, background } = draft;
+        onStampChangeRef.current(meta.stamp);
+        if (meta.mmPerPx != null) onMmPerPxChangeRef.current(meta.mmPerPx);
+        if (background) {
+          const blobUrl = URL.createObjectURL(background);
+          if (meta.bgPlace) bgPlaceRef.current = { ...meta.bgPlace };
+          pendingDraftRestoreRef.current = {
+            items: meta.items,
+            stampOwnerId: meta.stampOwnerId,
+            mmPerPx: meta.mmPerPx,
+          };
+          onImportBgRef.current(blobUrl);
+        } else {
+          applyDraftItems(meta.items, meta.stampOwnerId);
+          draftRestoringRef.current = false;
+          onDraftSavedRef.current?.("Restored sketch from this browser");
+        }
+      } catch {
+        draftRestoringRef.current = false;
+      }
+    })();
 
     return () => {
       canvas.removeEventListener("wheel", onWheel);
@@ -4354,6 +5076,10 @@ export function DrawCanvas({
       window.removeEventListener("mouseup", onNativeUp);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("pagehide", onPageHide);
+      document.removeEventListener("visibilitychange", onVisChange);
+      if (draftSaveTimer != null) window.clearTimeout(draftSaveTimer);
+      void flushDraftSave();
       ro.disconnect();
       clearDrawMarkers();
       clearGizmos();
@@ -4378,7 +5104,17 @@ export function DrawCanvas({
 
   useEffect(() => {
     (scopeRef.current as unknown as ScopeExtras | null)?.__syncStamp?.();
-  }, [stampGapMm, wallThicknessMm, mmPerPx]);
+  }, [
+    stampGapMm,
+    wallThicknessMm,
+    mmPerPx,
+    stampOutlineEnabled,
+    stampOutlineWidthMm,
+  ]);
+
+  useEffect(() => {
+    (scopeRef.current as unknown as ScopeExtras | null)?.__scheduleDraftSave?.();
+  }, [stamp]);
 
   useEffect(() => {
     if (imagePanelToken === 0) return;
@@ -4391,6 +5127,11 @@ export function DrawCanvas({
     if (deleteToken === 0) return;
     (scopeRef.current as unknown as ScopeExtras | null)?.__deleteCurrent?.();
   }, [deleteToken]);
+
+  useEffect(() => {
+    if (clearToken === 0) return;
+    (scopeRef.current as unknown as ScopeExtras | null)?.__clearCanvas?.();
+  }, [clearToken]);
 
   useEffect(() => {
     if (undoToken === 0) return;
@@ -4415,6 +5156,11 @@ export function DrawCanvas({
       buildPdfBytes: async () =>
         (await (scopeRef.current as unknown as ScopeExtras | null)?.__buildSketchPdfBytes?.()) ??
         null,
+      saveDraft: async () => {
+        (scopeRef.current as unknown as ScopeExtras | null)?.__flushDraftSave?.(
+          true,
+        );
+      },
     };
     return () => {
       saveApiRef.current = null;
@@ -4471,6 +5217,8 @@ export function DrawCanvas({
       (scope as unknown as ScopeExtras).__setSnapGrid?.();
       if (pendingPdfImportRef.current) {
         finishPendingPdfImportRef.current?.(raster);
+      } else if (pendingDraftRestoreRef.current) {
+        finishPendingDraftRestoreRef.current?.();
       }
       const n = (scope as unknown as ScopeExtras).__rebuildImageContours?.(
         traceThreshold,
@@ -4482,6 +5230,9 @@ export function DrawCanvas({
       bgPlaceRef.current = null;
       if (pendingPdfImportRef.current) {
         finishPendingPdfImportRef.current?.(null);
+      } else if (pendingDraftRestoreRef.current) {
+        // Still restore vectors even if background decode failed
+        finishPendingDraftRestoreRef.current?.();
       }
     };
     bgRef.current = raster;
@@ -4510,12 +5261,17 @@ export function DrawCanvas({
   useEffect(() => {
     const scope = scopeRef.current as unknown as ScopeExtras | null;
     if (!scope || !imageDataRef.current || !traceOpen) return;
+    if (!showTraceCurves) {
+      scope.__clearImageContours?.();
+      setTraceCurveCount(0);
+      return;
+    }
     const id = window.setTimeout(() => {
       const n = scope.__rebuildImageContours?.(traceThreshold, traceSmooth);
       if (typeof n === "number") setTraceCurveCount(n);
     }, 60);
     return () => window.clearTimeout(id);
-  }, [traceThreshold, traceSmooth, traceOpen]);
+  }, [traceThreshold, traceSmooth, traceOpen, showTraceCurves, traceMode]);
 
   useEffect(() => {
     (scopeRef.current as unknown as ScopeExtras | null)?.__setBgVisible?.(
@@ -4718,19 +5474,60 @@ export function DrawCanvas({
     }
   };
 
+  const pickImportableFile = (files: Iterable<File>): File | null => {
+    const list = [...files];
+    return (
+      list.find(isVectorFile) ??
+      list.find((f) => isRasterImageFile(f) || f.type.startsWith("image/")) ??
+      null
+    );
+  };
+
   const onDrop = (ev: DragEvent) => {
     ev.preventDefault();
-    const files = [...ev.dataTransfer.files];
-    const vector = files.find(isVectorFile);
-    if (vector) {
-      importDroppedOrPickedFile(vector);
-      return;
-    }
-    const image = files.find(
-      (f) => isRasterImageFile(f) || f.type.startsWith("image/"),
-    );
-    if (image) importDroppedOrPickedFile(image);
+    const file = pickImportableFile(ev.dataTransfer.files);
+    if (file) importDroppedOrPickedFile(file);
   };
+
+  // Document-level so Ctrl+V works even when focus isn't on the canvas.
+  useEffect(() => {
+    const onPaste = (ev: ClipboardEvent) => {
+      const target = ev.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      const cd = ev.clipboardData;
+      if (!cd) return;
+      const fromItems: File[] = [];
+      for (const item of cd.items) {
+        if (item.kind !== "file") continue;
+        const f = item.getAsFile();
+        if (f) fromItems.push(f);
+      }
+      const file =
+        [...fromItems, ...cd.files].find(isVectorFile) ??
+        [...fromItems, ...cd.files].find(
+          (f) => isRasterImageFile(f) || f.type.startsWith("image/"),
+        ) ??
+        null;
+      if (!file) return;
+      ev.preventDefault();
+      if (isVectorFile(file)) {
+        void (
+          scopeRef.current as unknown as ScopeExtras | null
+        )?.__importVectorFile?.(file);
+      } else {
+        onImportBgRef.current(URL.createObjectURL(file));
+      }
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, []);
 
   useEffect(() => {
     if (!measureEdit) return;
@@ -4871,6 +5668,32 @@ export function DrawCanvas({
             <Box component="p" sx={{ m: 0, fontSize: 10, color: "text.secondary", lineHeight: 1.3 }}>
               Inside the wall, plus this clearance
             </Box>
+            <FormControlLabel
+              sx={{
+                mx: 0,
+                mt: 0.5,
+                width: "100%",
+                justifyContent: "space-between",
+              }}
+              labelPlacement="start"
+              control={
+                <Switch
+                  size="small"
+                  checked={stampOutlineEnabled}
+                  onChange={(_, checked) =>
+                    onStampOutlineEnabledChange(checked)
+                  }
+                />
+              }
+              label={
+                <Box
+                  component="span"
+                  sx={{ fontSize: 11, color: "text.secondary" }}
+                >
+                  Raised outline
+                </Box>
+              }
+            />
           </Box>
         )}
       </Box>
@@ -4890,61 +5713,85 @@ export function DrawCanvas({
             py: 0.75,
           }}
         >
-          <Box sx={{ display: "flex", gap: 0.5, mb: 0.5 }}>
-            <Button
-              size="small"
-              variant={featureHud.raised ? "contained" : "outlined"}
-              onClick={() =>
-                (scopeRef.current as unknown as ScopeExtras | null)?.__setFeatureRaised?.(
-                  true,
-                )
-              }
-              sx={{ textTransform: "none", flex: 1, bgcolor: featureHud.raised ? "#7f1d1d" : undefined }}
-            >
-              Raised
-            </Button>
-            <Button
-              size="small"
-              variant={!featureHud.raised ? "contained" : "outlined"}
-              onClick={() =>
-                (scopeRef.current as unknown as ScopeExtras | null)?.__setFeatureRaised?.(
-                  false,
-                )
-              }
-              sx={{
-                textTransform: "none",
-                flex: 1,
-                bgcolor: !featureHud.raised ? "#1e3a8a" : undefined,
-              }}
-            >
-              Recessed
-            </Button>
-          </Box>
-          {featureHud.closed && (
-            <FormControlLabel
-              sx={{ mx: 0, mb: 0.25, width: "100%", justifyContent: "space-between" }}
-              labelPlacement="start"
-              control={
-                <Switch
+          {!featureHud.rim && (
+            <>
+              <Box sx={{ display: "flex", gap: 0.5, mb: 0.5 }}>
+                <Button
                   size="small"
-                  checked={featureHud.filled}
-                  onChange={() =>
+                  variant={featureHud.raised ? "contained" : "outlined"}
+                  onClick={() =>
                     (
                       scopeRef.current as unknown as ScopeExtras | null
-                    )?.__toggleFeatureFill?.()
+                    )?.__setFeatureRaised?.(true)
+                  }
+                  sx={{
+                    textTransform: "none",
+                    flex: 1,
+                    bgcolor: featureHud.raised ? "#7f1d1d" : undefined,
+                  }}
+                >
+                  Raised
+                </Button>
+                <Button
+                  size="small"
+                  variant={!featureHud.raised ? "contained" : "outlined"}
+                  onClick={() =>
+                    (
+                      scopeRef.current as unknown as ScopeExtras | null
+                    )?.__setFeatureRaised?.(false)
+                  }
+                  sx={{
+                    textTransform: "none",
+                    flex: 1,
+                    bgcolor: !featureHud.raised ? "#1e3a8a" : undefined,
+                  }}
+                >
+                  Recessed
+                </Button>
+              </Box>
+              {featureHud.closed && (
+                <FormControlLabel
+                  sx={{
+                    mx: 0,
+                    mb: 0.25,
+                    width: "100%",
+                    justifyContent: "space-between",
+                  }}
+                  labelPlacement="start"
+                  control={
+                    <Switch
+                      size="small"
+                      checked={featureHud.filled}
+                      onChange={() =>
+                        (
+                          scopeRef.current as unknown as ScopeExtras | null
+                        )?.__toggleFeatureFill?.()
+                      }
+                    />
+                  }
+                  label={
+                    <Box
+                      component="span"
+                      sx={{ fontSize: 11, color: "text.secondary" }}
+                    >
+                      Fill
+                    </Box>
                   }
                 />
-              }
-              label={
-                <Box component="span" sx={{ fontSize: 11, color: "text.secondary" }}>
-                  Fill
-                </Box>
-              }
-            />
+              )}
+            </>
+          )}
+          {featureHud.rim && (
+            <Box
+              component="p"
+              sx={{ m: 0, mb: 0.5, fontSize: 11, color: "text.secondary" }}
+            >
+              Raised outline
+            </Box>
           )}
           <Box sx={{ display: "flex", justifyContent: "space-between" }}>
             <Box component="span" sx={{ fontSize: 11, color: "text.secondary" }}>
-              Line width
+              {featureHud.rim ? "Width" : "Line width"}
             </Box>
             <Box component="span" sx={{ fontSize: 11 }}>
               {featureHud.widthMm.toFixed(2)} mm
@@ -4961,7 +5808,9 @@ export function DrawCanvas({
                 v as number,
               )
             }
-            aria-label="Stamp line width"
+            aria-label={
+              featureHud.rim ? "Stamp outline width" : "Stamp line width"
+            }
           />
         </Box>
       )}
@@ -4971,8 +5820,10 @@ export function DrawCanvas({
             position: "absolute",
             inset: 0,
             display: "flex",
+            flexDirection: "column",
             alignItems: "center",
             justifyContent: "center",
+            gap: 12,
             pointerEvents: "none",
             color: "#9aa0a6",
             fontSize: 15,
@@ -4980,9 +5831,33 @@ export function DrawCanvas({
             userSelect: "none",
           }}
         >
-          Drop image, SVG or PDF — or start drawing
+          Drop or paste image, SVG or PDF — or start drawing
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => setExamplesOpen(true)}
+            sx={{
+              pointerEvents: "auto",
+              textTransform: "none",
+              color: "#546e7a",
+              borderColor: "#cfd8dc",
+              bgcolor: "rgba(255,255,255,0.9)",
+              "&:hover": {
+                borderColor: "#c45c26",
+                color: "#c45c26",
+                bgcolor: "#fff",
+              },
+            }}
+          >
+            Load example
+          </Button>
         </div>
       )}
+      <ExamplesDialog
+        open={examplesOpen}
+        onClose={() => setExamplesOpen(false)}
+        onPick={importDroppedOrPickedFile}
+      />
       {mode === "measure" && measureReadout && !measureEdit && (
         <div
           style={{
@@ -5009,10 +5884,10 @@ export function DrawCanvas({
       <Tooltip
         title={
           hasClosedCurve
-            ? "Save sketch as PDF (closed curve ready)"
+            ? "Download sketch PDF (Ctrl+S saves a browser draft)"
             : hasCurves
-              ? "Save sketch as PDF"
-              : "Draw a curve to save"
+              ? "Download sketch PDF (Ctrl+S saves a browser draft)"
+              : "Draw a curve to save — autosaves in this browser"
         }
         placement="left"
       >
@@ -5113,14 +5988,22 @@ export function DrawCanvas({
             threshold={traceThreshold}
             smooth={traceSmooth}
             showBackground={showBackground}
+            showTraceCurves={showTraceCurves}
+            traceMode={traceMode}
             backgroundOpacity={bgOpacity}
             curveCount={traceCurveCount}
             onThresholdChange={setTraceThreshold}
             onSmoothChange={setTraceSmooth}
             onShowBackgroundChange={setShowBackground}
+            onShowTraceCurvesChange={setShowTraceCurves}
+            onTraceModeChange={setTraceMode}
             onBackgroundOpacityChange={setBgOpacity}
             onLoadImage={(url) => onImportBgRef.current(url)}
             onLoadFile={importDroppedOrPickedFile}
+            onRemoveImage={() => {
+              onClearBackgroundRef.current();
+              (scopeRef.current as unknown as ScopeExtras | null)?.__scheduleDraftSave?.();
+            }}
             onHide={() => {
               setTraceOpen(false);
               onImagePanelOpenChangeRef.current(false);
@@ -5203,6 +6086,31 @@ export function DrawCanvas({
             >
               <ListItemText primary="Flip vertical" />
             </MenuItem>
+            {ctxMenu.meta.path.closed && (
+              <>
+                <Divider />
+                <MenuItem
+                  onClick={() => {
+                    closeMenu();
+                    (
+                      scopeRef.current as unknown as ScopeExtras | null
+                    )?.__offsetClosedByMm?.(0.5);
+                  }}
+                >
+                  <ListItemText primary="Grow 0.5 mm" />
+                </MenuItem>
+                <MenuItem
+                  onClick={() => {
+                    closeMenu();
+                    (
+                      scopeRef.current as unknown as ScopeExtras | null
+                    )?.__offsetClosedByMm?.(-0.5);
+                  }}
+                >
+                  <ListItemText primary="Shrink 0.5 mm" />
+                </MenuItem>
+              </>
+            )}
           </>
         )}
         {ctxMenu?.kind === "object" && (
@@ -5223,6 +6131,31 @@ export function DrawCanvas({
             >
               <ListItemText primary="Flip vertical" />
             </MenuItem>
+            {ctxMenu.meta.path.closed && (
+              <>
+                <Divider />
+                <MenuItem
+                  onClick={() => {
+                    closeMenu();
+                    (
+                      scopeRef.current as unknown as ScopeExtras | null
+                    )?.__offsetClosedByMm?.(0.5);
+                  }}
+                >
+                  <ListItemText primary="Grow 0.5 mm" />
+                </MenuItem>
+                <MenuItem
+                  onClick={() => {
+                    closeMenu();
+                    (
+                      scopeRef.current as unknown as ScopeExtras | null
+                    )?.__offsetClosedByMm?.(-0.5);
+                  }}
+                >
+                  <ListItemText primary="Shrink 0.5 mm" />
+                </MenuItem>
+              </>
+            )}
           </>
         )}
         {ctxMenu?.kind === "curve" && (
@@ -5234,6 +6167,30 @@ export function DrawCanvas({
               <MenuItem onClick={() => applyCurveMenu("close")}>
                 <ListItemText primary="Close curve" />
               </MenuItem>
+            )}
+            {ctxMenu.meta.path.closed && (
+              <>
+                <MenuItem
+                  onClick={() => {
+                    closeMenu();
+                    (
+                      scopeRef.current as unknown as ScopeExtras | null
+                    )?.__offsetClosedByMm?.(0.5);
+                  }}
+                >
+                  <ListItemText primary="Grow 0.5 mm" />
+                </MenuItem>
+                <MenuItem
+                  onClick={() => {
+                    closeMenu();
+                    (
+                      scopeRef.current as unknown as ScopeExtras | null
+                    )?.__offsetClosedByMm?.(-0.5);
+                  }}
+                >
+                  <ListItemText primary="Shrink 0.5 mm" />
+                </MenuItem>
+              </>
             )}
             <MenuItem onClick={() => applyCurveMenu("delete-segment")}>
               <ListItemText primary="Delete segment" />

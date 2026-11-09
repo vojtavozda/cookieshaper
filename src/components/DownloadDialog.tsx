@@ -14,12 +14,14 @@ import PictureAsPdfOutlinedIcon from "@mui/icons-material/PictureAsPdfOutlined";
 import ContentCutOutlinedIcon from "@mui/icons-material/ContentCutOutlined";
 import ApprovalOutlinedIcon from "@mui/icons-material/ApprovalOutlined";
 import FolderZipOutlinedIcon from "@mui/icons-material/FolderZipOutlined";
+import LayersOutlinedIcon from "@mui/icons-material/LayersOutlined";
+import { preloadUnionWasm } from "../geometry/unionSolid";
 
 const BMC_HREF = "https://www.buymeacoffee.com/vojtavozda";
 const BMC_IMG =
   "https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=vojtavozda&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff";
 
-export type DownloadChoice = "sketch" | "cutter" | "stamp" | "zip";
+export type DownloadChoice = "sketch" | "cutter" | "stamp" | "assembly" | "zip";
 
 type Props = {
   open: boolean;
@@ -47,12 +49,19 @@ export function DownloadDialog({
     if (!open) {
       setDownloaded(false);
       setBusyChoice(null);
+      return;
     }
+    // Warm manifold wasm while the user picks a download option.
+    preloadUnionWasm();
   }, [open]);
 
   const run = async (choice: DownloadChoice) => {
     if (busy) return;
     setBusyChoice(choice);
+    // Let the busy spinner paint before sync-heavy STL/PDF work starts.
+    await new Promise<void>((r) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => r())),
+    );
     try {
       const saved = await onChoose(choice);
       if (saved) setDownloaded(true);
@@ -143,9 +152,17 @@ export function DownloadDialog({
             onClick={() => void run("stamp")}
           />
           <ChoiceButton
+            icon={<LayersOutlinedIcon />}
+            label="Cutter + stamp (STL)"
+            hint="One solid cutter and one solid stamp, still nested — Split to parts in PrusaSlicer"
+            disabled={!canCutter || !canStamp || (busy && busyChoice !== "assembly")}
+            loading={busyChoice === "assembly"}
+            onClick={() => void run("assembly")}
+          />
+          <ChoiceButton
             icon={<FolderZipOutlinedIcon />}
             label="Everything (ZIP)"
-            hint="Sketch + cutter + stamp in one archive"
+            hint="Sketch, separate STLs, and the nested cutter+stamp STL"
             disabled={!canZip || (busy && busyChoice !== "zip")}
             loading={busyChoice === "zip"}
             primary

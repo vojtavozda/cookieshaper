@@ -53,6 +53,32 @@ export function offsetClosedClipper(pts: Vec2[], delta: number): Vec2[] | null {
   return largest(out);
 }
 
+/**
+ * Raised rim band flush with the stamp plate edge: outer = outline,
+ * inner = outline inset by `width` (inward thickness).
+ */
+export function rimAnnulus(outline: Vec2[], width: number): Vec2[][] {
+  if (outline.length < 3 || width <= 1e-6) return [];
+  const inner = offsetClosedClipper(outline, -width);
+  if (!inner || inner.length < 3) return [];
+  const rings = differenceD(
+    [toPath(outline)],
+    [toPath(inner)],
+    FillRule.NonZero,
+    2,
+  );
+  return rings
+    .filter((p) => p.length >= 3 && Math.abs(areaD(p)) > 1e-4)
+    .map(fromPath);
+}
+
+/**
+ * Clipper2 arcTolerance (double units, ×10^precision internally).
+ * 0 → library default (~0.2% of radius) so round endcaps stay smooth.
+ * A fixed 0.15 used to leave open strokes with ~1–2 points per semicircle.
+ */
+const ROUND_ARC_TOL = 0;
+
 /** Closed ribbon (stroke) or open stroke, as one or more filled loops. */
 export function strokePolygons(
   pts: Vec2[],
@@ -62,12 +88,36 @@ export function strokePolygons(
   if (pts.length < 2 || halfWidth <= 1e-6) return [];
   const path = toPath(pts);
   if (closed && pts.length >= 3) {
-    const outer = inflatePathsD([path], halfWidth, JoinType.Round, EndType.Polygon, 2, 2, 0.15);
-    const inner = inflatePathsD([path], -halfWidth, JoinType.Round, EndType.Polygon, 2, 2, 0.15);
+    const outer = inflatePathsD(
+      [path],
+      halfWidth,
+      JoinType.Round,
+      EndType.Polygon,
+      2,
+      2,
+      ROUND_ARC_TOL,
+    );
+    const inner = inflatePathsD(
+      [path],
+      -halfWidth,
+      JoinType.Round,
+      EndType.Polygon,
+      2,
+      2,
+      ROUND_ARC_TOL,
+    );
     if (!inner.length) return outer;
     return differenceD(outer, inner, FillRule.NonZero, 2);
   }
-  return inflatePathsD([path], halfWidth, JoinType.Round, EndType.Round, 2, 2, 0.15);
+  return inflatePathsD(
+    [path],
+    halfWidth,
+    JoinType.Round,
+    EndType.Round,
+    2,
+    2,
+    ROUND_ARC_TOL,
+  );
 }
 
 /**
@@ -95,7 +145,7 @@ export function featureFootprints(
       EndType.Polygon,
       2,
       2,
-      0.15,
+      ROUND_ARC_TOL,
     );
     shapes = pad.length ? pad : [toPath(pts)];
   } else {

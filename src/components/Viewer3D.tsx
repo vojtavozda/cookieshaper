@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { IconButton, Paper, Stack, Tooltip } from "@mui/material";
+import { Divider, IconButton, Paper, Stack, Tooltip } from "@mui/material";
 import {
   Box,
   ScanBox,
@@ -651,6 +651,10 @@ export function Viewer3D({ group }: Props) {
             </IconButton>
           </Tooltip>
           */}
+          <Divider
+            flexItem
+            sx={{ width: 28, alignSelf: "center", borderColor: "divider", my: 0.35 }}
+          />
           <Tooltip
             title={showCutter ? "Hide cutter" : "Show cutter"}
             placement="right"

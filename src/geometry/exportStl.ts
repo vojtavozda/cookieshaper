@@ -1,23 +1,54 @@
 import * as THREE from "three";
 import { mergeGroupGeometry } from "./buildCutter";
 import { saveBlob, type SaveResult } from "./saveBlob";
+import { unionObjectGeometry } from "./unionSolid";
 
-function geometryToAsciiStl(geo: THREE.BufferGeometry, solidName: string): string {
+/** Let the browser paint / handle input between heavy sync chunks. */
+function yieldToMain(): Promise<void> {
+  const sched = (
+    globalThis as unknown as {
+      scheduler?: { yield?: () => Promise<void> };
+    }
+  ).scheduler;
+  if (sched?.yield) return sched.yield();
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function triangleCount(geo: THREE.BufferGeometry): number {
+  const index = geo.index;
+  if (index) return Math.floor(index.count / 3);
+  const pos = geo.getAttribute("position");
+  return pos ? Math.floor(pos.count / 3) : 0;
+}
+
+/**
+ * Binary STL (80-byte header + uint32 count + 50 bytes/triangle).
+ * Far cheaper than ASCII string building, which was freezing the UI.
+ */
+async function geometryToBinaryStl(
+  geo: THREE.BufferGeometry,
+  solidName: string,
+): Promise<Uint8Array> {
   const pos = geo.getAttribute("position") as THREE.BufferAttribute;
   const index = geo.index;
-  let triangles = "";
+  const nTri = triangleCount(geo);
+  const out = new Uint8Array(84 + nTri * 50);
+  const view = new DataView(out.buffer);
+  const enc = new TextEncoder();
+  const header = enc.encode(`binary ${solidName}`.slice(0, 80));
+  out.set(header, 0);
+  view.setUint32(80, nTri, true);
 
-  const writeTri = (
-    ax: number,
-    ay: number,
-    az: number,
-    bx: number,
-    by: number,
-    bz: number,
-    cx: number,
-    cy: number,
-    cz: number,
-  ) => {
+  const writeTri = (offset: number, a: number, b: number, c: number) => {
+    const ax = pos.getX(a);
+    const ay = pos.getY(a);
+    const az = pos.getZ(a);
+    const bx = pos.getX(b);
+    const by = pos.getY(b);
+    const bz = pos.getZ(b);
+    const cx = pos.getX(c);
+    const cy = pos.getY(c);
+    const cz = pos.getZ(c);
     const ux = bx - ax;
     const uy = by - ay;
     const uz = bz - az;
@@ -31,47 +62,116 @@ function geometryToAsciiStl(geo: THREE.BufferGeometry, solidName: string): strin
     nx /= nl;
     ny /= nl;
     nz /= nl;
-    triangles += `facet normal ${nx} ${ny} ${nz}\n outer loop\n`;
-    triangles += `  vertex ${ax} ${ay} ${az}\n`;
-    triangles += `  vertex ${bx} ${by} ${bz}\n`;
-    triangles += `  vertex ${cx} ${cy} ${cz}\n`;
-    triangles += ` endloop\nendfacet\n`;
+    view.setFloat32(offset, nx, true);
+    view.setFloat32(offset + 4, ny, true);
+    view.setFloat32(offset + 8, nz, true);
+    view.setFloat32(offset + 12, ax, true);
+    view.setFloat32(offset + 16, ay, true);
+    view.setFloat32(offset + 20, az, true);
+    view.setFloat32(offset + 24, bx, true);
+    view.setFloat32(offset + 28, by, true);
+    view.setFloat32(offset + 32, bz, true);
+    view.setFloat32(offset + 36, cx, true);
+    view.setFloat32(offset + 40, cy, true);
+    view.setFloat32(offset + 44, cz, true);
+    view.setUint16(offset + 48, 0, true);
   };
+
+  const YIELD_EVERY = 8000;
+  let written = 0;
+  let o = 84;
 
   if (index) {
     for (let i = 0; i < index.count; i += 3) {
-      const a = index.getX(i);
-      const b = index.getX(i + 1);
-      const c = index.getX(i + 2);
-      writeTri(
-        pos.getX(a),
-        pos.getY(a),
-        pos.getZ(a),
-        pos.getX(b),
-        pos.getY(b),
-        pos.getZ(b),
-        pos.getX(c),
-        pos.getY(c),
-        pos.getZ(c),
-      );
+      writeTri(o, index.getX(i), index.getX(i + 1), index.getX(i + 2));
+      o += 50;
+      written++;
+      if (written % YIELD_EVERY === 0) await yieldToMain();
     }
   } else {
     for (let i = 0; i < pos.count; i += 3) {
-      writeTri(
-        pos.getX(i),
-        pos.getY(i),
-        pos.getZ(i),
-        pos.getX(i + 1),
-        pos.getY(i + 1),
-        pos.getZ(i + 1),
-        pos.getX(i + 2),
-        pos.getY(i + 2),
-        pos.getZ(i + 2),
-      );
+      writeTri(o, i, i + 1, i + 2);
+      o += 50;
+      written++;
+      if (written % YIELD_EVERY === 0) await yieldToMain();
     }
   }
 
-  return `solid ${solidName}\n${triangles}endsolid ${solidName}\n`;
+  return out;
+}
+
+/** Append triangles from `geo` into an existing binary STL buffer builder. */
+async function appendBinaryTriangles(
+  geos: THREE.BufferGeometry[],
+  solidName: string,
+): Promise<Uint8Array> {
+  let nTri = 0;
+  for (const g of geos) nTri += triangleCount(g);
+  const out = new Uint8Array(84 + nTri * 50);
+  const view = new DataView(out.buffer);
+  const enc = new TextEncoder();
+  out.set(enc.encode(`binary ${solidName}`.slice(0, 80)), 0);
+  view.setUint32(80, nTri, true);
+
+  const YIELD_EVERY = 8000;
+  let written = 0;
+  let o = 84;
+
+  for (const geo of geos) {
+    const pos = geo.getAttribute("position") as THREE.BufferAttribute;
+    const index = geo.index;
+    const writeTri = (a: number, b: number, c: number) => {
+      const ax = pos.getX(a);
+      const ay = pos.getY(a);
+      const az = pos.getZ(a);
+      const bx = pos.getX(b);
+      const by = pos.getY(b);
+      const bz = pos.getZ(b);
+      const cx = pos.getX(c);
+      const cy = pos.getY(c);
+      const cz = pos.getZ(c);
+      const ux = bx - ax;
+      const uy = by - ay;
+      const uz = bz - az;
+      const vx = cx - ax;
+      const vy = cy - ay;
+      const vz = cz - az;
+      let nx = uy * vz - uz * vy;
+      let ny = uz * vx - ux * vz;
+      let nz = ux * vy - uy * vx;
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      view.setFloat32(o, nx / nl, true);
+      view.setFloat32(o + 4, ny / nl, true);
+      view.setFloat32(o + 8, nz / nl, true);
+      view.setFloat32(o + 12, ax, true);
+      view.setFloat32(o + 16, ay, true);
+      view.setFloat32(o + 20, az, true);
+      view.setFloat32(o + 24, bx, true);
+      view.setFloat32(o + 28, by, true);
+      view.setFloat32(o + 32, bz, true);
+      view.setFloat32(o + 36, cx, true);
+      view.setFloat32(o + 40, cy, true);
+      view.setFloat32(o + 44, cz, true);
+      view.setUint16(o + 48, 0, true);
+      o += 50;
+    };
+
+    if (index) {
+      for (let i = 0; i < index.count; i += 3) {
+        writeTri(index.getX(i), index.getX(i + 1), index.getX(i + 2));
+        written++;
+        if (written % YIELD_EVERY === 0) await yieldToMain();
+      }
+    } else {
+      for (let i = 0; i < pos.count; i += 3) {
+        writeTri(i, i + 1, i + 2);
+        written++;
+        if (written % YIELD_EVERY === 0) await yieldToMain();
+      }
+    }
+  }
+
+  return out;
 }
 
 /** Minimal ZIP (store only) so cutter + stamp can download as one archive. */
@@ -193,11 +293,47 @@ function partGroups(root: THREE.Group): {
   return { cutter, stamp };
 }
 
-function stlBytesForPart(part: THREE.Object3D, solidName: string): Uint8Array {
-  const geo = mergeGroupGeometry(part as THREE.Group);
-  const stl = geometryToAsciiStl(geo, solidName);
+async function stlBytesForPart(
+  part: THREE.Object3D,
+  solidName: string,
+): Promise<Uint8Array> {
+  await yieldToMain();
+  const geo = mergeGroupGeometry(part as THREE.Group, { normals: false });
+  await yieldToMain();
+  const bytes = await geometryToBinaryStl(geo, solidName);
   geo.dispose();
-  return new TextEncoder().encode(stl);
+  return bytes;
+}
+
+/**
+ * Cutter and stamp in one STL: each is boolean-unioned into a single solid
+ * so PrusaSlicer Split → To parts yields two parts, still nested.
+ * Binary STL packs both disconnected shells into one file.
+ */
+export async function downloadAssemblyStl(
+  group: THREE.Group,
+  filename = "pernicek-cutter-stamp.stl",
+): Promise<SaveResult | false> {
+  const bytes = await assemblyStlBytes(group);
+  if (!bytes) return false;
+  return saveBlob(new Blob([bytes], { type: "model/stl" }), filename);
+}
+
+async function assemblyStlBytes(group: THREE.Group): Promise<Uint8Array | null> {
+  const { cutter, stamp } = partGroups(group);
+  if (!cutter || !stamp) return null;
+  await yieldToMain();
+  const cutterGeo = await unionObjectGeometry(cutter);
+  await yieldToMain();
+  const stampGeo = await unionObjectGeometry(stamp);
+  await yieldToMain();
+  const bytes = await appendBinaryTriangles(
+    [cutterGeo, stampGeo],
+    "cutter-stamp",
+  );
+  cutterGeo.dispose();
+  stampGeo.dispose();
+  return bytes;
 }
 
 export async function downloadCutterStl(
@@ -207,7 +343,7 @@ export async function downloadCutterStl(
   const { cutter } = partGroups(group);
   if (!cutter) return false;
   return saveBlob(
-    new Blob([stlBytesForPart(cutter, "cutter")], { type: "model/stl" }),
+    new Blob([await stlBytesForPart(cutter, "cutter")], { type: "model/stl" }),
     filename,
   );
 }
@@ -219,7 +355,7 @@ export async function downloadStampStl(
   const { stamp } = partGroups(group);
   if (!stamp) return false;
   return saveBlob(
-    new Blob([stlBytesForPart(stamp, "stamp")], { type: "model/stl" }),
+    new Blob([await stlBytesForPart(stamp, "stamp")], { type: "model/stl" }),
     filename,
   );
 }
@@ -233,12 +369,27 @@ export async function downloadProjectZip(
   const { cutter, stamp } = partGroups(group);
   const files: { name: string; data: Uint8Array }[] = [...extras];
   if (cutter) {
-    files.push({ name: "pernicek-cutter.stl", data: stlBytesForPart(cutter, "cutter") });
+    files.push({
+      name: "pernicek-cutter.stl",
+      data: await stlBytesForPart(cutter, "cutter"),
+    });
+    await yieldToMain();
   }
   if (stamp) {
-    files.push({ name: "pernicek-stamp.stl", data: stlBytesForPart(stamp, "stamp") });
+    files.push({
+      name: "pernicek-stamp.stl",
+      data: await stlBytesForPart(stamp, "stamp"),
+    });
+    await yieldToMain();
+  }
+  if (cutter && stamp) {
+    const assembly = await assemblyStlBytes(group);
+    if (assembly) {
+      files.push({ name: "pernicek-cutter-stamp.stl", data: assembly });
+    }
   }
   if (!files.length) return false;
+  await yieldToMain();
   return saveBlob(zipStore(files), zipName);
 }
 

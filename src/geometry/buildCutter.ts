@@ -280,15 +280,19 @@ function addStackedKnife(
   z0: number,
   knifeHeight: number,
   layerMm: number,
+  tipWidthMm: number,
 ) {
   if (knifeHeight <= 1e-3 || half <= 1e-3) return;
+  const tipHalf = Math.min(half, Math.max(0, tipWidthMm / 2));
   const step = Math.min(0.5, Math.max(0.1, layerMm || 0.2));
   const layers = Math.max(2, Math.min(40, Math.ceil(knifeHeight / step)));
   const dh = knifeHeight / layers;
   let tipMesh: THREE.Mesh | null = null;
   for (let i = 0; i < layers; i++) {
     const h0 = i * dh;
-    const halfT = half * (1 - h0 / knifeHeight);
+    // Linear taper from wall half-width down to a flat tip (not a razor point)
+    const t = Math.min(1, Math.max(0, h0 / knifeHeight));
+    const halfT = tipHalf + (half - tipHalf) * (1 - t);
     if (halfT < 0.025) continue;
     const outer = ensureCcw(cleanClosedPolyline(offsetClosed(mid, halfT)));
     const inner = ensureCcw(cleanClosedPolyline(offsetClosed(mid, -halfT)));
@@ -409,6 +413,7 @@ export function buildCutter(
         params.wallHeightMm,
         params.knifeHeightMm,
         params.bevelLayerMm,
+        params.knifeTipMm,
       );
     } else {
       addStackedKnife(
@@ -418,6 +423,7 @@ export function buildCutter(
         params.wallHeightMm,
         params.knifeHeightMm,
         params.bevelLayerMm,
+        params.knifeTipMm,
       );
     }
   }
@@ -431,7 +437,10 @@ export function buildCutter(
 }
 
 /** Merge all meshes in the group into one BufferGeometry for STL export. */
-export function mergeGroupGeometry(group: THREE.Group): THREE.BufferGeometry {
+export function mergeGroupGeometry(
+  group: THREE.Group,
+  opts: { normals?: boolean } = {},
+): THREE.BufferGeometry {
   const geos: THREE.BufferGeometry[] = [];
   group.updateMatrixWorld(true);
   group.traverse((obj) => {
@@ -445,10 +454,8 @@ export function mergeGroupGeometry(group: THREE.Group): THREE.BufferGeometry {
   if (geos.length === 0) return new THREE.BufferGeometry();
   // Manual merge (avoid deprecated GeometryUtils dependency issues)
   let vertCount = 0;
-  let idxCount = 0;
   for (const g of geos) {
     vertCount += g.getAttribute("position").count;
-    idxCount += g.index ? g.index.count : g.getAttribute("position").count;
   }
   const positions = new Float32Array(vertCount * 3);
   const indices: number[] = [];
@@ -456,21 +463,38 @@ export function mergeGroupGeometry(group: THREE.Group): THREE.BufferGeometry {
   let pOffset = 0;
   for (const g of geos) {
     const pos = g.getAttribute("position") as THREE.BufferAttribute;
-    for (let i = 0; i < pos.count; i++) {
-      positions[pOffset++] = pos.getX(i);
-      positions[pOffset++] = pos.getY(i);
-      positions[pOffset++] = pos.getZ(i);
+    // Prefer bulk copy when the attribute is tightly packed float32
+    const arr = pos.array;
+    const interleaved = (pos as THREE.InterleavedBufferAttribute)
+      .isInterleavedBufferAttribute;
+    if (
+      !interleaved &&
+      arr instanceof Float32Array &&
+      pos.itemSize === 3 &&
+      !pos.normalized
+    ) {
+      positions.set(arr.subarray(0, pos.count * 3), pOffset);
+      pOffset += pos.count * 3;
+    } else {
+      for (let i = 0; i < pos.count; i++) {
+        positions[pOffset++] = pos.getX(i);
+        positions[pOffset++] = pos.getY(i);
+        positions[pOffset++] = pos.getZ(i);
+      }
     }
     if (g.index) {
-      for (let i = 0; i < g.index.count; i++) indices.push(g.index.getX(i) + vOffset);
+      const idx = g.index.array;
+      for (let i = 0; i < g.index.count; i++) indices.push((idx[i] as number) + vOffset);
     } else {
       for (let i = 0; i < pos.count; i++) indices.push(vOffset + i);
     }
     vOffset += pos.count;
+    g.dispose();
   }
   const merged = new THREE.BufferGeometry();
   merged.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   merged.setIndex(indices);
-  merged.computeVertexNormals();
+  // STL writes its own facet normals — skip expensive vertex normals for export.
+  if (opts.normals !== false) merged.computeVertexNormals();
   return merged;
 }

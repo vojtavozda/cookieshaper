@@ -14,7 +14,16 @@ import {
 } from "@mui/material";
 import DownloadIcon from "@mui/icons-material/Download";
 import RefreshIcon from "@mui/icons-material/Refresh";
-import { BUILD_METHODS, type BuildMethod, type CutterParams, type SizeReadout, type StampParams } from "../types";
+import {
+  BUILD_METHODS,
+  THICKNESS_PRESETS,
+  matchesThicknessPreset,
+  type BuildMethod,
+  type CutterParams,
+  type SizeReadout,
+  type StampParams,
+  type ThicknessPresetId,
+} from "../types";
 import { WheelSlider } from "./WheelSlider";
 
 /* Buy-me-a-coffee panel UI hidden for now — restore from git history when needed. */
@@ -34,7 +43,7 @@ type Props = {
   onMethodChange: (m: BuildMethod) => void;
   onChange: (next: CutterParams) => void;
   onLiveUpdateChange: (v: boolean) => void;
-  onResetDefaults: () => void;
+  onThicknessPreset: (id: ThicknessPresetId) => void;
   /** Opens the save dialog (always available; options inside are gated). */
   onDownload: () => void;
   onApply: () => void;
@@ -65,7 +74,7 @@ function ParamSlider({
   disabled?: boolean;
   onChange: (v: number) => void;
 }) {
-  return (
+  const control = (
     <Box sx={{ opacity: disabled ? 0.45 : 1 }}>
       <Stack
         direction="row"
@@ -93,16 +102,14 @@ function ParamSlider({
           mx: 0,
         }}
       />
-      {hint && (
-        <Typography
-          variant="caption"
-          color="text.secondary"
-          sx={{ display: "block", mt: -0.5, lineHeight: 1.3 }}
-        >
-          {hint}
-        </Typography>
-      )}
     </Box>
+  );
+
+  if (!hint) return control;
+  return (
+    <Tooltip title={hint} enterDelay={400} placement="left">
+      <Box>{control}</Box>
+    </Tooltip>
   );
 }
 
@@ -117,7 +124,7 @@ export function ParamsPanel({
   onMethodChange,
   onChange,
   onLiveUpdateChange,
-  onResetDefaults,
+  onThicknessPreset,
   onDownload,
   onApply,
   onShowWallProfile,
@@ -126,6 +133,10 @@ export function ParamsPanel({
 }: Props) {
   const set = <K extends keyof CutterParams>(key: K, value: CutterParams[K]) =>
     onChange({ ...params, [key]: value });
+
+  const activePreset = THICKNESS_PRESETS.find((p) =>
+    matchesThicknessPreset(p, params, stamp),
+  )?.id;
 
   const wallHalf = params.wallThicknessMm / 2;
   /** Overhang past the outer wall face (UI); 0 = flush with wall. */
@@ -137,11 +148,13 @@ export function ParamsPanel({
   };
 
   const setWallThickness = (wt: number) => {
-    // Keep the same outer overhang when wall thickness changes
+    // Keep the same outer overhang when wall thickness changes;
+    // clamp knife tip so it never exceeds wall thickness.
     onChange({
       ...params,
       wallThicknessMm: wt,
       rimWidthMm: flangeOverhang + wt / 2,
+      knifeTipMm: Math.min(params.knifeTipMm, wt),
     });
   };
 
@@ -204,27 +217,33 @@ export function ParamsPanel({
           </FormControl>
         )}
 
-        <Box sx={{ opacity: enabled ? 1 : 0.45 }}>
-          <Stack
-            direction="row"
-            sx={{ justifyContent: "space-between", alignItems: "baseline" }}
-          >
-            <Typography variant="body2">Scale</Typography>
-            <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>
-              {sizeLabel}
-            </Typography>
-          </Stack>
-          <WheelSlider
-            size="small"
-            value={params.sizeMm}
-            min={10}
-            max={300}
-            step={1}
-            disabled={!enabled}
-            onChange={(_, v) => set("sizeMm", v as number)}
-            sx={{ display: "block", width: "100%", boxSizing: "border-box", px: 0.5 }}
-          />
-        </Box>
+        <Tooltip
+          title="Longer side of the outline bounding box (aspect ratio kept)"
+          enterDelay={400}
+          placement="left"
+        >
+          <Box sx={{ opacity: enabled ? 1 : 0.45 }}>
+            <Stack
+              direction="row"
+              sx={{ justifyContent: "space-between", alignItems: "baseline" }}
+            >
+              <Typography variant="body2">Scale</Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>
+                {sizeLabel}
+              </Typography>
+            </Stack>
+            <WheelSlider
+              size="small"
+              value={params.sizeMm}
+              min={10}
+              max={300}
+              step={1}
+              disabled={!enabled}
+              onChange={(_, v) => set("sizeMm", v as number)}
+              sx={{ display: "block", width: "100%", boxSizing: "border-box", px: 0.5 }}
+            />
+          </Box>
+        </Tooltip>
 
         <ParamSlider
           label="Base width"
@@ -233,6 +252,7 @@ export function ParamsPanel({
           max={12}
           step={0.1}
           disabled={!enabled}
+          hint="Flange overhang past the outer wall face (0 = flush)"
           onChange={setFlangeOverhang}
         />
         <ParamSlider
@@ -242,6 +262,7 @@ export function ParamsPanel({
           max={4}
           step={0.1}
           disabled={!enabled || !hasFlange}
+          hint="Thickness of the bottom flange / foot"
           onChange={(v) => set("baseHeightMm", v)}
         />
         <ParamSlider
@@ -251,6 +272,7 @@ export function ParamsPanel({
           max={3}
           step={0.1}
           disabled={!enabled}
+          hint="Cutting wall width; thinner cuts cleaner, thicker is sturdier"
           onChange={setWallThickness}
         />
         <ParamSlider
@@ -260,6 +282,7 @@ export function ParamsPanel({
           max={30}
           step={0.5}
           disabled={!enabled}
+          hint="Straight wall height below the knife edge"
           onChange={(v) => set("wallHeightMm", v)}
         />
         <ParamSlider
@@ -269,6 +292,7 @@ export function ParamsPanel({
           max={5}
           step={0.1}
           disabled={!enabled || !hasFlange || params.baseHeightMm <= 0}
+          hint="Rounded transition from flange top into the outer wall"
           onChange={(v) => set("filletRadiusMm", v)}
         />
         <ParamSlider
@@ -278,7 +302,18 @@ export function ParamsPanel({
           max={6}
           step={0.1}
           disabled={!enabled}
+          hint="Tapered cutting tip on top of the wall"
           onChange={(v) => set("knifeHeightMm", v)}
+        />
+        <ParamSlider
+          label="Knife tip width"
+          value={Math.min(params.knifeTipMm, params.wallThicknessMm)}
+          min={0}
+          max={params.wallThicknessMm}
+          step={0.05}
+          disabled={!enabled || params.knifeHeightMm <= 0}
+          hint="Flat top of the cutting edge (avoids stacked hairlines)"
+          onChange={(v) => set("knifeTipMm", v)}
         />
         <ParamSlider
           label="Layer thickness"
@@ -287,6 +322,7 @@ export function ParamsPanel({
           max={0.5}
           step={0.05}
           disabled={!enabled}
+          hint="Slice height used to build bevels and the knife (match print layer)"
           onChange={(v) => set("bevelLayerMm", v)}
         />
 
@@ -303,6 +339,7 @@ export function ParamsPanel({
               min={0.8}
               max={12}
               step={0.1}
+              hint="Overall stamp plate thickness"
               onChange={(v) =>
                 onStampChange({
                   ...stamp,
@@ -317,6 +354,7 @@ export function ParamsPanel({
               min={0.1}
               max={4}
               step={0.05}
+              hint="How far raised stamp features protrude from the plate"
               onChange={(v) => onStampChange({ ...stamp, raiseMm: v })}
             />
             <ParamSlider
@@ -325,6 +363,7 @@ export function ParamsPanel({
               min={0.1}
               max={stamp.plateMm}
               step={0.05}
+              hint="How deep recessed stamp features cut into the plate"
               onChange={(v) => onStampChange({ ...stamp, recessMm: v })}
             />
             <Divider />
@@ -381,9 +420,24 @@ export function ParamsPanel({
               Show wall profile
             </Button>
           )}
-          <Button variant="outlined" onClick={onResetDefaults}>
-            Reset to defaults
-          </Button>
+          <Typography variant="caption" color="text.secondary">
+            Presets
+          </Typography>
+          <Stack direction="row" spacing={1}>
+            {THICKNESS_PRESETS.map((p) => (
+              <Tooltip key={p.id} title={p.hint}>
+                <Button
+                  fullWidth
+                  size="small"
+                  variant={activePreset === p.id ? "contained" : "outlined"}
+                  onClick={() => onThicknessPreset(p.id)}
+                  sx={{ textTransform: "none" }}
+                >
+                  {p.label}
+                </Button>
+              </Tooltip>
+            ))}
+          </Stack>
         </Stack>
       </Stack>
 

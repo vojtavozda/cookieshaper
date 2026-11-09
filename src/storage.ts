@@ -164,3 +164,39 @@ export function saveBmcStyle(style: BmcStyle) {
     /* ignore */
   }
 }
+
+const SPLIT_KEY = "pernickovac.splitLeftFrac";
+const SPLIT_COLLAPSED_KEY = "pernickovac.splitCollapsed";
+const SPLIT_DEFAULT = 0.45;
+
+export type SplitLayout = {
+  /** Canvas width while the 3D pane is open (0.25–0.75). */
+  leftFrac: number;
+  collapsed: boolean;
+};
+
+function clampSplitFrac(n: number, fallback = SPLIT_DEFAULT): number {
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(0.75, Math.max(0.25, n));
+}
+
+/** Canvas | 3D divider, including a fully hidden 3D pane. */
+export function loadSplitLayout(): SplitLayout {
+  try {
+    const v = localStorage.getItem(SPLIT_KEY);
+    const n = v == null ? SPLIT_DEFAULT : Number(v);
+    const collapsed = localStorage.getItem(SPLIT_COLLAPSED_KEY) === "1";
+    return { leftFrac: clampSplitFrac(n), collapsed };
+  } catch {
+    return { leftFrac: SPLIT_DEFAULT, collapsed: false };
+  }
+}
+
+export function saveSplitLayout(layout: SplitLayout) {
+  try {
+    localStorage.setItem(SPLIT_KEY, String(clampSplitFrac(layout.leftFrac)));
+    localStorage.setItem(SPLIT_COLLAPSED_KEY, layout.collapsed ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}

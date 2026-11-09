@@ -76,3 +76,30 @@ export function simplifyClosedCapped(
   }
   return out;
 }
+
+/** Douglas–Peucker on an open polyline (endpoints always kept). */
+export function simplifyOpen(pts: Vec2[], eps: number): Vec2[] {
+  const n = pts.length;
+  if (n <= 2) return pts.map((p) => ({ ...p }));
+  const keep = new Array<boolean>(n).fill(false);
+  keep[0] = true;
+  keep[n - 1] = true;
+  dpRange(pts, eps, keep, 0, n - 1);
+  const out = pts.filter((_, i) => keep[i]);
+  return out.length >= 2 ? out : pts.map((p) => ({ ...p }));
+}
+
+/** Simplify an open polyline, relaxing until it fits `maxPts`. */
+export function simplifyOpenCapped(
+  pts: Vec2[],
+  eps: number,
+  maxPts: number,
+): Vec2[] {
+  let tol = eps;
+  let out = simplifyOpen(pts, tol);
+  while (out.length > maxPts && tol < 4) {
+    tol *= 1.7;
+    out = simplifyOpen(pts, tol);
+  }
+  return out;
+}

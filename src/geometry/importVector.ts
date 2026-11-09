@@ -493,6 +493,10 @@ export type PdfImportResult = {
   background: PdfBackground | null;
   /** Fit gap from `/StampGapMm` when present. */
   stampGapMm: number | null;
+  /** Raised outline from `/StampOutline` when present. */
+  stampOutlineEnabled: boolean | null;
+  /** Outline rim width from `/StampOutlineWidthMm` when present. */
+  stampOutlineWidthMm: number | null;
 };
 
 /** `/StampGapMm` written by our exporter. */
@@ -504,6 +508,25 @@ export function pdfStampGapMm(data: Uint8Array): number | null {
   if (!m) return null;
   const n = parseFloat(m[1]);
   return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/** `/StampOutline true|false` written by our exporter. */
+export function pdfStampOutlineEnabled(data: Uint8Array): boolean | null {
+  const text = new TextDecoder("latin1").decode(data);
+  const m = text.match(/\/StampOutline\s+(true|false)/i);
+  if (!m) return null;
+  return m[1].toLowerCase() === "true";
+}
+
+/** `/StampOutlineWidthMm` written by our exporter. */
+export function pdfStampOutlineWidthMm(data: Uint8Array): number | null {
+  const text = new TextDecoder("latin1").decode(data);
+  const m = text.match(
+    /\/StampOutlineWidthMm\s+([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)/,
+  );
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 /** `/BgRect [x y w h]` written by our exporter (content space = post-unflip paths). */
@@ -605,7 +628,14 @@ export async function pathsFromPdf(data: Uint8Array): Promise<PdfImportResult> {
     }
   }
 
-  return { paths, mmPerPx, background, stampGapMm: pdfStampGapMm(data) };
+  return {
+    paths,
+    mmPerPx,
+    background,
+    stampGapMm: pdfStampGapMm(data),
+    stampOutlineEnabled: pdfStampOutlineEnabled(data),
+    stampOutlineWidthMm: pdfStampOutlineWidthMm(data),
+  };
 }
 
 export async function pathsFromPdfFile(file: File): Promise<PdfImportResult> {

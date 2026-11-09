@@ -12,7 +12,11 @@ import {
 } from "clipper2-ts";
 import type { StampFeatureIn, Vec2 } from "../types";
 import { ensureCcw, mapMm, mmFrame, signedArea } from "./offset";
-import { featureFootprints, offsetClosedClipper } from "./stampGeom";
+import {
+  featureFootprints,
+  offsetClosedClipper,
+  rimAnnulus,
+} from "./stampGeom";
 
 const PLATE_COLOR = 0xd9c4a0;
 /** Slightly darker floor so recessed pockets read against the top face. */
@@ -80,7 +84,41 @@ function extrude(
   return mesh;
 }
 
-/** Positive loops with negative holes that fall inside them. */
+function ringCentroid(path: PathD): { x: number; y: number } {
+  let x = 0;
+  let y = 0;
+  for (const p of path) {
+    x += p.x;
+    y += p.y;
+  }
+  const n = path.length || 1;
+  return { x: x / n, y: y / n };
+}
+
+function pointInRing(outer: Vec2[], probe: { x: number; y: number }): boolean {
+  let inside = false;
+  for (let i = 0, j = outer.length - 1; i < outer.length; j = i++) {
+    const yi = outer[i].y;
+    const yj = outer[j].y;
+    const xi = outer[i].x;
+    const xj = outer[j].x;
+    const den = yj - yi;
+    if (
+      yi > probe.y !== yj > probe.y &&
+      probe.x < ((xj - xi) * (probe.y - yi)) / (den || 1e-12) + xi
+    ) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/**
+ * Positive loops with the negative holes that belong inside them.
+ * A hole only nests in a larger loop that contains its centroid — otherwise
+ * the stamp rim's inner cut (almost as big as the plate) gets stolen by a
+ * feature that happens to cover one vertex, and the rim extrudes solid.
+ */
 function groupRings(paths: PathsD): { outer: Vec2[]; holes: Vec2[][] }[] {
   const pos = paths.filter((p) => p.length >= 3 && areaD(p) > 1e-4);
   const neg = paths.filter((p) => p.length >= 3 && areaD(p) < -1e-4);
@@ -91,28 +129,16 @@ function groupRings(paths: PathsD): { outer: Vec2[]; holes: Vec2[][] }[] {
     holes: [] as Vec2[][],
   }));
   for (const hole of neg) {
-    const probe = hole[0];
+    const holeA = Math.abs(areaD(hole));
+    const probe = ringCentroid(hole);
     let best: (typeof buckets)[number] | null = null;
     let bestA = Infinity;
     for (const b of buckets) {
-      if (Math.abs(areaD(b.path)) >= bestA) continue;
-      const outer = b.outer;
-      let inside = false;
-      for (let i = 0, j = outer.length - 1; i < outer.length; j = i++) {
-        const yi = outer[i].y;
-        const yj = outer[j].y;
-        const xi = outer[i].x;
-        const xj = outer[j].x;
-        if (
-          yi > probe.y !== yj > probe.y &&
-          probe.x < ((xj - xi) * (probe.y - yi)) / (yj - yi) + xi
-        ) {
-          inside = !inside;
-        }
-      }
-      if (inside) {
+      const hostA = Math.abs(areaD(b.path));
+      if (hostA <= holeA + 1e-4 || hostA >= bestA) continue;
+      if (pointInRing(b.outer, probe)) {
         best = b;
-        bestA = Math.abs(areaD(b.path));
+        bestA = hostA;
       }
     }
     if (best) best.holes.push(fromPath(hole));
@@ -161,6 +187,9 @@ export type BuildStampArgs = {
   raiseMm: number;
   recessMm: number;
   features: StampFeatureIn[];
+  /** Raised rim along plate edge (annulus inward from outline). */
+  outlineEnabled?: boolean;
+  outlineWidthMm?: number;
 };
 
 export function buildStamp(args: BuildStampArgs): THREE.Group {
@@ -175,6 +204,13 @@ export function buildStamp(args: BuildStampArgs): THREE.Group {
 
   const raisedPaths: PathsD = [];
   const recessedPaths: PathsD = [];
+
+  if (args.outlineEnabled !== false) {
+    const rimW = Math.max(0.05, args.outlineWidthMm ?? 0.6);
+    const rim = rimAnnulus(outline, rimW);
+    raisedPaths.push(...footprintsToPaths(rim));
+  }
+
   for (const f of args.features) {
     if (f.points.length < 2) continue;
     const mmPts = f.points.map((p) => mapMm(p, frame));

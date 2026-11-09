@@ -6,7 +6,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Alert, Box, Snackbar, Typography } from "@mui/material";
+import { Alert, Box, Button, Snackbar, SvgIcon, Typography } from "@mui/material";
+import type { SvgIconProps } from "@mui/material/SvgIcon";
 import * as THREE from "three";
 import { DrawCanvas, type CanvasSaveApi } from "./components/DrawCanvas";
 import { ToolRail, type CanvasMode } from "./components/ToolRail";
@@ -20,14 +21,15 @@ import {
 } from "./components/DownloadDialog";
 import { buildCutter } from "./geometry/buildCutter";
 import {
+  downloadAssemblyStl,
   downloadCutterStl,
   downloadProjectZip,
   downloadStampStl,
 } from "./geometry/exportStl";
 import { bboxSize } from "./geometry/offset";
 import {
-  DEFAULT_PARAMS,
   DEFAULT_STAMP,
+  THICKNESS_PRESETS,
   type CutterParams,
   type BuildMethod,
   type SizeReadout,
@@ -40,12 +42,23 @@ import {
   loadMmPerPx,
   loadParams,
   loadSnapGrid,
+  loadSplitLayout,
   saveBuildMethod,
   saveMmPerPx,
   saveParams,
   saveSnapGrid,
+  saveSplitLayout,
 } from "./storage";
 import { buildStamp } from "./geometry/buildStamp";
+
+/** Lucide no longer ships brand marks — classic GitHub glyph. */
+function GithubIcon(props: SvgIconProps) {
+  return (
+    <SvgIcon {...props} viewBox="0 0 24 24">
+      <path d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.17 6.839 9.49.5.09.682-.217.682-.482 0-.237-.009-.866-.013-1.7-2.782.604-3.369-1.341-3.369-1.341-.454-1.155-1.11-1.463-1.11-1.463-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0 1 12 6.844a9.59 9.59 0 0 1 2.504.337c1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0 0 22 12c0-5.523-4.477-10-10-10z" />
+    </SvgIcon>
+  );
+}
 
 /** Subtle keycap for hint-bar shortcuts. */
 function Kbd({ children }: { children: ReactNode }) {
@@ -88,6 +101,7 @@ export default function App() {
   const [path, setPath] = useState<Vec2[] | null>(null);
   const [bgUrl, setBgUrl] = useState<string | null>(null);
   const [deleteToken, setDeleteToken] = useState(0);
+  const [clearToken, setClearToken] = useState(0);
   const [imagePanelToken, setImagePanelToken] = useState(0);
   const [imagePanelOpen, setImagePanelOpen] = useState(false);
   const [undoToken, setUndoToken] = useState(0);
@@ -112,6 +126,7 @@ export default function App() {
   const [meshGroup, setMeshGroup] = useState<THREE.Group | null>(null);
   const [sizeReadout, setSizeReadout] = useState<SizeReadout | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
   /** Paper → mm; calibrated by measure or Size. Independent of having a closed path. */
   const [mmPerPx, setMmPerPx] = useState<number | null>(() => loadMmPerPx());
   const meshRef = useRef<THREE.Group | null>(null);
@@ -167,6 +182,8 @@ export default function App() {
             raiseMm: sp.raiseMm,
             recessMm: sp.recessMm,
             features,
+            outlineEnabled: sp.outlineEnabled,
+            outlineWidthMm: sp.outlineWidthMm,
           });
           root.add(stampGroup);
         }
@@ -279,6 +296,11 @@ export default function App() {
       if (!result) throw new Error("No stamp mesh to export");
       return result === "saved";
     }
+    if (choice === "assembly") {
+      const result = mesh ? await downloadAssemblyStl(mesh) : false;
+      if (!result) throw new Error("Need both a cutter and a stamp");
+      return result === "saved";
+    }
     const extras: { name: string; data: Uint8Array }[] = [];
     const pdf = await saveApiRef.current?.buildPdfBytes();
     if (pdf) extras.push({ name: "pernicek.pdf", data: pdf });
@@ -356,6 +378,24 @@ export default function App() {
           <Kbd>Esc</Kbd>
           {snapGrid ? "" : " cancel"}
         </>,
+        <>
+          <Kbd>Ctrl</Kbd>+<Kbd>Z</Kbd> removes last point
+        </>,
+      );
+    }
+    if (canvasMode === "ellipse") {
+      return hintParts(
+        "Ellipse",
+        "drag corner to corner",
+        <>
+          <Kbd>Ctrl</Kbd> circle
+        </>,
+        <>
+          <Kbd>Shift</Kbd> from pinned center
+        </>,
+        <>
+          <Kbd>Space</Kbd>/middle pan
+        </>,
         ctrlZ,
       );
     }
@@ -386,11 +426,36 @@ export default function App() {
           color: "primary.contrastText",
           display: "flex",
           alignItems: "center",
+          justifyContent: "space-between",
+          gap: 1,
         }}
       >
         <Box component="span" sx={{ fontWeight: 700, letterSpacing: 0.3 }}>
           Perníčkovadlo — Cookie shaper
         </Box>
+        <Button
+          component="a"
+          href="https://github.com/vojtavozda/cookieshaper"
+          target="_blank"
+          rel="noopener noreferrer"
+          size="small"
+          startIcon={<GithubIcon sx={{ fontSize: 16 }} />}
+          sx={{
+            textTransform: "none",
+            color: "primary.contrastText",
+            borderColor: "rgba(255,255,255,0.55)",
+            px: 1.25,
+            py: 0.15,
+            minHeight: 0,
+            "&:hover": {
+              borderColor: "primary.contrastText",
+              bgcolor: "rgba(255,255,255,0.12)",
+            },
+          }}
+          variant="outlined"
+        >
+          GitHub
+        </Button>
       </Box>
 
       <Box sx={{ display: "flex", flex: 1, minHeight: 0 }}>
@@ -415,13 +480,22 @@ export default function App() {
           }}
           canDelete={hasSelection}
           onDeleteCurrent={() => setDeleteToken((t) => t + 1)}
+          canClearCanvas={hasCurves || !!bgUrl || !!path || !!stampFeatures}
+          onClearCanvas={() => setClearToken((t) => t + 1)}
           canUndo={canUndo}
           canRedo={canRedo}
           onUndo={() => setUndoToken((t) => t + 1)}
           onRedo={() => setRedoToken((t) => t + 1)}
+          canSaveDraft={hasCurves}
+          onSaveDraft={() => {
+            void saveApiRef.current?.saveDraft?.();
+          }}
         />
 
         <SplitPane
+          initialLeftFrac={loadSplitLayout().leftFrac}
+          initialCollapsed={loadSplitLayout().collapsed}
+          onLayoutChange={saveSplitLayout}
           left={
             <Box
               sx={{
@@ -442,6 +516,17 @@ export default function App() {
                   wallThicknessMm={params.wallThicknessMm}
                   stampGapMm={stamp.gapMm}
                   onStampGapChange={(gapMm) => setStamp((s) => ({ ...s, gapMm }))}
+                  stampOutlineEnabled={stamp.outlineEnabled}
+                  onStampOutlineEnabledChange={(outlineEnabled) =>
+                    setStamp((s) => ({ ...s, outlineEnabled }))
+                  }
+                  stampOutlineWidthMm={stamp.outlineWidthMm}
+                  onStampOutlineWidthChange={(outlineWidthMm) =>
+                    setStamp((s) => ({ ...s, outlineWidthMm }))
+                  }
+                  stamp={stamp}
+                  onStampChange={setStamp}
+                  onDraftSaved={setToast}
                   onStampFeatures={setStampFeatures}
                   mmPerPx={measureMmPerPx}
                   onMmPerPxChange={setMmPerPx}
@@ -462,9 +547,14 @@ export default function App() {
                     if (bgUrl) URL.revokeObjectURL(bgUrl);
                     setBgUrl(url);
                   }}
+                  onClearBackground={() => {
+                    if (bgUrl) URL.revokeObjectURL(bgUrl);
+                    setBgUrl(null);
+                  }}
                   imagePanelToken={imagePanelToken}
                   onImagePanelOpenChange={setImagePanelOpen}
                   deleteToken={deleteToken}
+                  clearToken={clearToken}
                   undoToken={undoToken}
                   redoToken={redoToken}
                   onHasCurvesChange={setHasCurves}
@@ -514,7 +604,11 @@ export default function App() {
                     px: 3,
                   }}
                 >
-                  <Typography color="text.secondary" align="center">
+                  <Typography
+                    color="text.secondary"
+                    align="center"
+                    sx={{ userSelect: "none" }}
+                  >
                     Close a path on the left to preview the 3D cutter here
                   </Typography>
                 </Box>
@@ -542,7 +636,13 @@ export default function App() {
             }
           }}
           onLiveUpdateChange={setLiveUpdate}
-          onResetDefaults={() => setParams({ ...DEFAULT_PARAMS })}
+          onThicknessPreset={(id) => {
+            const preset = THICKNESS_PRESETS.find((p) => p.id === id);
+            if (!preset) return;
+            // Keep current Size — it's driven by the drawing / measure
+            setParams((p) => ({ ...preset.params, sizeMm: p.sizeMm }));
+            setStamp({ ...preset.stamp });
+          }}
           onApply={() =>
             path && rebuild(path, params, buildMethod, stampFeatures, stamp)
           }
@@ -572,6 +672,13 @@ export default function App() {
           {error}
         </Alert>
       </Snackbar>
+      <Snackbar
+        open={!!toast}
+        autoHideDuration={2500}
+        onClose={() => setToast(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+        message={toast}
+      />
     </Box>
   );
 }

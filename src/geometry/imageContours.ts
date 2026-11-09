@@ -1,7 +1,15 @@
 import type { Vec2 } from "../types";
-import { simplifyClosedCapped } from "./pathLimits";
+// Package "module" points at a missing index.js; the built file is the real entry.
+import TraceSkeleton from "skeleton-tracing-js/dist/trace_skeleton.js";
+import {
+  simplifyClosedCapped,
+  simplifyOpenCapped,
+} from "./pathLimits";
 
 export type Contour = Vec2[];
+
+/** Outline border of dark blobs, or stroke centerlines (open/closed). */
+export type TraceMode = "outlines" | "lines";
 
 /** Luminance 0–255 from RGBA. */
 function grayAt(data: Uint8ClampedArray, i: number): number {
@@ -10,8 +18,8 @@ function grayAt(data: Uint8ClampedArray, i: number): number {
 }
 
 /**
- * Threshold like the Python pipeline (dark foreground).
- * Returns a binary mask (1 = ink).
+ * Dark-foreground mask. Higher threshold = stricter (only darker ink).
+ * 0 → almost everything; 255 → only pure black.
  */
 export function thresholdMask(
   imageData: ImageData,
@@ -20,8 +28,9 @@ export function thresholdMask(
   const n = imageData.width * imageData.height;
   const bin = new Uint8Array(n);
   const data = imageData.data;
+  const cutoff = 255 - Math.min(255, Math.max(0, threshold));
   for (let i = 0; i < n; i++) {
-    bin[i] = grayAt(data, i) < threshold ? 1 : 0;
+    bin[i] = grayAt(data, i) <= cutoff ? 1 : 0;
   }
   return bin;
 }
@@ -177,6 +186,71 @@ export function prepareContourForEdit(pts: Contour, amount: number): Contour {
   // Cap anchors for editability: ~240 at 0 → ~48 at 1
   const maxPts = Math.max(24, Math.round(240 - amt * 192));
   return simplifyClosedCapped(smoothed, eps, maxPts);
+}
+
+/** Moving-average smooth for an open polyline. */
+export function smoothOpenContour(pts: Contour, amount: number): Contour {
+  if (pts.length < 3 || amount <= 0.01) return pts.map((p) => ({ ...p }));
+  const n = pts.length;
+  const radius = Math.max(1, Math.round(amount * 6));
+  const out: Contour = [{ ...pts[0] }];
+  for (let i = 1; i < n - 1; i++) {
+    let sx = 0;
+    let sy = 0;
+    let wsum = 0;
+    for (let k = -radius; k <= radius; k++) {
+      const j = Math.max(0, Math.min(n - 1, i + k));
+      const w = radius + 1 - Math.abs(k);
+      sx += pts[j].x * w;
+      sy += pts[j].y * w;
+      wsum += w;
+    }
+    out.push({ x: sx / wsum, y: sy / wsum });
+  }
+  out.push({ ...pts[n - 1] });
+  return out;
+}
+
+/** Prepare an open centerline for editing. */
+export function prepareOpenContourForEdit(pts: Contour, amount: number): Contour {
+  if (pts.length < 2) return pts.map((p) => ({ ...p }));
+  const amt = Math.min(1, Math.max(0, amount));
+  const smoothed =
+    amt <= 0.02
+      ? pts.map((p) => ({ ...p }))
+      : smoothOpenContour(pts, Math.min(1, amt * 0.85));
+  const eps = 0.9 + amt * 5.5;
+  const maxPts = Math.max(8, Math.round(180 - amt * 140));
+  return simplifyOpenCapped(smoothed, eps, maxPts);
+}
+
+
+/**
+ * Stroke centerlines via skeleton-tracing (Zhang–Suen + polyline tracing).
+ * Returns the medial axis of thick ink as open (or nearly closed) polylines,
+ * not the outline of the stroke.
+ */
+export function findStrokeCenterlines(
+  imageData: ImageData,
+  threshold: number,
+  opts?: { maxPaths?: number; minPoints?: number; simplifyAmount?: number },
+): Contour[] {
+  const w = imageData.width;
+  const h = imageData.height;
+  const bin = thresholdMask(imageData, threshold);
+  const minPts = opts?.minPoints ?? 6;
+  const maxN = opts?.maxPaths ?? 48;
+  // 1 = ink. Chunk size 10 is the library default (smaller chunks, cleaner seams).
+  const traced = TraceSkeleton.trace(Array.from(bin), w, h, 10);
+  const paths: Contour[] = [];
+  for (const poly of traced.polylines) {
+    if (!poly || poly.length < 2) continue;
+    const pts = poly.map(([x, y]) => ({ x, y }));
+    if (pts.length < minPts) continue;
+    paths.push(pts);
+  }
+  paths.sort((a, b) => b.length - a.length);
+  return paths.slice(0, maxN);
 }
 
 /** Map image-pixel contours into Paper project space given a placed raster. */

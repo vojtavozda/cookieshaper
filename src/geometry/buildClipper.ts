@@ -175,16 +175,19 @@ export function addStackedKnifeClipper(
   z0: number,
   knifeHeight: number,
   layerMm: number,
+  tipWidthMm: number,
 ) {
   if (knifeHeight <= 1e-3 || half <= 1e-3) return;
+  const tipHalf = Math.min(half, Math.max(0, tipWidthMm / 2));
   const step = Math.min(0.5, Math.max(0.1, layerMm || 0.2));
   const layers = Math.max(2, Math.min(40, Math.ceil(knifeHeight / step)));
   const dh = knifeHeight / layers;
   let tipMeshes: THREE.Mesh[] = [];
   for (let i = 0; i < layers; i++) {
     const h0 = i * dh;
-    // Width at the bottom of this slice — linear taper to a point
-    const halfT = half * (1 - h0 / knifeHeight);
+    // Width at the bottom of this slice — taper to a flat tip, not a point
+    const t = Math.min(1, Math.max(0, h0 / knifeHeight));
+    const halfT = tipHalf + (half - tipHalf) * (1 - t);
     if (halfT < 0.025) continue;
     // Miter keeps the sketch corner angle on the cutting edge.
     // (Round joins arc the tip and add vertices that aren't in the curve.)

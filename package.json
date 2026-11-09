@@ -14,11 +14,14 @@
     "@emotion/styled": "^11.14.1",
     "@mui/icons-material": "^9.5.0",
     "@mui/material": "^9.5.0",
+    "@vercel/analytics": "^2.0.1",
     "clipper2-ts": "^2.0.1-18",
     "lucide-react": "^1.69.0",
+    "manifold-3d": "^3.5.4",
     "paper": "^0.16.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "skeleton-tracing-js": "^1.0.4",
     "three": "^0.187.0"
   },
   "devDependencies": {

@@ -114,6 +114,10 @@ export type SketchPdfOptions = {
   background?: SketchPdfBackground | null;
   /** Stamp fit gap (mm) stored in PDF Info for round-trip. */
   stampGapMm?: number | null;
+  /** Raised outline rim toggle for round-trip. */
+  stampOutlineEnabled?: boolean | null;
+  /** Raised outline rim width (mm) for round-trip. */
+  stampOutlineWidthMm?: number | null;
 };
 
 /** Encode a raster URL / data-URL as JPEG for PDF embedding. */
@@ -307,6 +311,15 @@ export function buildSketchPdf(
   }
   if (options.stampGapMm != null && Number.isFinite(options.stampGapMm)) {
     info += ` /StampGapMm ${fmt(options.stampGapMm)}`;
+  }
+  if (options.stampOutlineEnabled != null) {
+    info += ` /StampOutline ${options.stampOutlineEnabled ? "true" : "false"}`;
+  }
+  if (
+    options.stampOutlineWidthMm != null &&
+    Number.isFinite(options.stampOutlineWidthMm)
+  ) {
+    info += ` /StampOutlineWidthMm ${fmt(options.stampOutlineWidthMm)}`;
   }
   info += " >>\n";
   push(info);

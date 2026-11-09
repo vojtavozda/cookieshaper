@@ -18,9 +18,11 @@ export function CrossSection({ params, onHide }: Props) {
     wallHeightMm: wh,
     filletRadiusMm: fr,
     knifeHeightMm: kh,
+    knifeTipMm: tip,
   } = params;
 
   const half = wt / 2;
+  const tipHalf = Math.min(half, Math.max(0, tip / 2));
   const r = Math.min(fr, Math.max(0, rim - half), Math.max(0, wh - bh));
 
   const svgW = 132;
@@ -53,7 +55,8 @@ export function CrossSection({ params, onHide }: Props) {
     ]);
   }
   pts.push([wallOuter, wh]);
-  pts.push([0, wh + kh]);
+  pts.push([tipHalf, wh + kh]);
+  pts.push([-tipHalf, wh + kh]);
   pts.push([wallInner, wh]);
   pts.push([wallInner, 0]);
 
