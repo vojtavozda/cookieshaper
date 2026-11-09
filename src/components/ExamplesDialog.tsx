@@ -53,7 +53,9 @@ export function ExamplesDialog({ open, onClose, onPick }: Props) {
       onClose={onClose}
       maxWidth="sm"
       fullWidth
-      PaperProps={{ sx: { borderRadius: 1.5 } }}
+      slotProps={{
+        paper: { sx: { borderRadius: 1.5 } },
+      }}
     >
       <DialogTitle
         sx={{

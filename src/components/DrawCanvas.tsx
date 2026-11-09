@@ -416,7 +416,7 @@ export function DrawCanvas({
   const drawStartMarkerRef = useRef<paper.Item | null>(null);
   const magnetRingRef = useRef<paper.Path.Circle | null>(null);
   const dragRef = useRef<DragEdit | null>(null);
-  const curveHoverRef = useRef<paper.Path | null>(null);
+  const curveHoverRef = useRef<paper.Item | null>(null);
   const measureLineRef = useRef<paper.Item | null>(null);
   const measureDotsRef = useRef<paper.Item[]>([]);
   const hoverNodeRef = useRef<{ meta: PathMeta; index: number } | null>(null);

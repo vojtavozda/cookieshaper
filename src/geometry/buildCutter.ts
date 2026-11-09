@@ -462,11 +462,12 @@ export function mergeGroupGeometry(
   let vOffset = 0;
   let pOffset = 0;
   for (const g of geos) {
-    const pos = g.getAttribute("position") as THREE.BufferAttribute;
+    const pos = g.getAttribute("position");
     // Prefer bulk copy when the attribute is tightly packed float32
     const arr = pos.array;
-    const interleaved = (pos as THREE.InterleavedBufferAttribute)
-      .isInterleavedBufferAttribute;
+    const interleaved =
+      "isInterleavedBufferAttribute" in pos &&
+      (pos as THREE.InterleavedBufferAttribute).isInterleavedBufferAttribute;
     if (
       !interleaved &&
       arr instanceof Float32Array &&
