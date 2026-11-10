@@ -28,6 +28,11 @@ export type ImportedPath = {
   widthMm?: number;
   /** Raised plate-edge rim — visual only; rebuilt from StampOutline on import. */
   stampRim?: boolean;
+  /**
+   * Drawn stamp-outline curve (outer edge of the raised rim).
+   * The cutter is rebuilt around it on import; old PDFs omit this.
+   */
+  stampPlate?: boolean;
 };
 
 /** Raised stamp red / recessed stamp blue used in our PDF export. */
@@ -39,6 +44,11 @@ export const STAMP_RECESS_RGB: [number, number, number] = [0.118, 0.227, 0.541];
  * /StampOutline metadata) while Inkscape still shows a red fill.
  */
 export const STAMP_RIM_RGB: [number, number, number] = [0.62, 0.16, 0.16];
+/**
+ * Authoritative stamp-outline curve (stamp drawn first).
+ * Far from black, feature red, and rim red so older PDFs stay cutters.
+ */
+export const STAMP_PLATE_RGB: [number, number, number] = [0.05, 0.42, 0.38];
 
 function colorDist(
   a: [number, number, number],
@@ -53,10 +63,18 @@ function colorDist(
 /** Classify a stroke color: reds → raised, blues → recessed, else cutter. */
 export function classifyStampColor(
   rgb: [number, number, number] | undefined,
-): { role: "cutter" | "feature"; raised: boolean; stampRim?: boolean } {
+): {
+  role: "cutter" | "feature";
+  raised: boolean;
+  stampRim?: boolean;
+  stampPlate?: boolean;
+} {
   if (!rgb) return { role: "cutter", raised: true };
   const [r, g, b] = rgb;
   // Exact / near matches for our own export colors first
+  if (colorDist(rgb, STAMP_PLATE_RGB) < 0.08) {
+    return { role: "cutter", raised: true, stampPlate: true };
+  }
   if (colorDist(rgb, STAMP_RIM_RGB) < 0.12) {
     return { role: "feature", raised: true, stampRim: true };
   }
@@ -233,6 +251,7 @@ function parsePdfContent(content: string): ImportedPath[] {
       role: cls.role,
       raised: cls.raised,
       stampRim: isRim || undefined,
+      stampPlate: cls.stampPlate || undefined,
     });
     rings = [];
     build = { segs: [], closed: false, cur: null, start: null };

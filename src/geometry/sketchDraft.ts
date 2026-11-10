@@ -23,6 +23,10 @@ export type SketchDraftItem = {
   raised?: boolean;
   widthMm?: number;
   filled?: boolean;
+  /** Bézier that is the stamp rim’s outer edge. Cutter is derived. */
+  stampPlate?: boolean;
+  /** Cutter generated from the stamp-plate path with this id. */
+  derivedFromId?: string;
 };
 
 export type SketchDraftMeta = {

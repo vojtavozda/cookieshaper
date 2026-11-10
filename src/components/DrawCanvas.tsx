@@ -21,7 +21,7 @@ import {
 } from "@mui/material";
 import SaveAltIcon from "@mui/icons-material/SaveAlt";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutlined";
-import { Stamp } from "lucide-react";
+import { PawPrint, Stamp } from "lucide-react";
 import type { Vec2 } from "../types";
 import type { CanvasMode } from "./ToolRail";
 import { ExamplesDialog } from "./ExamplesDialog";
@@ -54,6 +54,7 @@ import {
   isVectorFile,
   mmPerPxFromSvg,
   pathsFromPdfFile,
+  STAMP_PLATE_RGB,
   STAMP_RAISE_RGB,
   STAMP_RECESS_RGB,
   STAMP_RIM_RGB,
@@ -68,6 +69,7 @@ import {
 } from "../geometry/exportSketchPdf";
 import { ensureCcw } from "../geometry/offset";
 import { offsetClosedClipper, stampRimLoopsPx } from "../geometry/stampGeom";
+import { JoinType } from "clipper2-ts";
 import {
   clearSketchDraft,
   loadSketchDraft,
@@ -106,6 +108,13 @@ type PathMeta = {
   filled?: boolean;
   /** Special raised rim along the stamp plate edge (not in metasRef). */
   stampRim?: boolean;
+  /**
+   * This Bézier is the outer edge of the raised stamp rim.
+   * A cutter is generated around it and is not edited on its own.
+   */
+  stampPlate?: boolean;
+  /** Set on the generated cutter; points at the stamp-plate path id. */
+  derivedFromId?: string;
 };
 
 type OpenEnd = { meta: PathMeta; which: "first" | "last"; marker: paper.Item };
@@ -200,6 +209,8 @@ type Snapshot = {
     raised?: boolean;
     widthMm?: number;
     filled?: boolean;
+    stampPlate?: boolean;
+    derivedFromId?: string;
   }[];
 };
 
@@ -223,7 +234,10 @@ type Props = {
   stamp: StampParams;
   onStampChange: (next: StampParams) => void;
   /** Features of the cutter curve currently driving the 3D view; null = no stamp. */
-  onStampFeatures: (features: StampFeatureIn[] | null) => void;
+  onStampFeatures: (
+    features: StampFeatureIn[] | null,
+    outlinePx?: Vec2[] | null,
+  ) => void;
   /** Short status after Ctrl+S draft flush. */
   onDraftSaved?: (message: string) => void;
   /** Paper units → mm (always defined; from measure calibration or Size). */
@@ -290,6 +304,10 @@ type ScopeExtras = {
   __mirrorObject?: (axis: "h" | "v") => void;
   /** Clipper2 outset/inset by a fixed mm amount (closed curves only). */
   __offsetClosedByMm?: (mm: number) => void;
+  /** Keep the selected closed curve as the stamp rim and build a cutter around it. */
+  __addCutterAroundOutline?: () => void;
+  /** Drop the generated cutter and turn the stamp-plate curve back into a normal path. */
+  __removeCutterAroundOutline?: () => void;
   __deleteCurrent?: () => void;
   __clearCanvas?: () => void;
   __undo?: () => void;
@@ -474,6 +492,7 @@ export function DrawCanvas({
   const onDraftSavedRef = useRef(onDraftSaved);
   onDraftSavedRef.current = onDraftSaved;
   const [stampUi, setStampUi] = useState<"off" | "add" | "edit" | "back">("off");
+  const [canAddCutterAround, setCanAddCutterAround] = useState(false);
   const [featureHud, setFeatureHud] = useState<{
     rim?: boolean;
     widthMm: number;
@@ -483,6 +502,8 @@ export function DrawCanvas({
   } | null>(null);
   const setStampUiRef = useRef(setStampUi);
   setStampUiRef.current = setStampUi;
+  const setCanAddCutterAroundRef = useRef(setCanAddCutterAround);
+  setCanAddCutterAroundRef.current = setCanAddCutterAround;
   const setFeatureHudRef = useRef(setFeatureHud);
   setFeatureHudRef.current = setFeatureHud;
   const mmPerPxRef = useRef(mmPerPx);
@@ -723,12 +744,38 @@ export function DrawCanvas({
       return m.id;
     };
 
+    /** Real cutter outline — not a stamp feature and not a stamp-plate Bézier. */
+    const isCutterShape = (m: PathMeta) =>
+      m.role !== "feature" && !m.stampPlate && !m.stampRim;
+
+    const derivedFor = (plate: PathMeta): PathMeta | null =>
+      metasRef.current.find((m) => m.derivedFromId && m.derivedFromId === plate.id) ??
+      null;
+
+    const plateFor = (cutter: PathMeta): PathMeta | null => {
+      if (!cutter.derivedFromId) return null;
+      return (
+        metasRef.current.find(
+          (m) => m.stampPlate && m.id === cutter.derivedFromId,
+        ) ?? null
+      );
+    };
+
     /** Stamp features belonging to this cutter (follow move/scale/rotate). */
-    const linkedStampFeatures = (cutter: PathMeta): PathMeta[] => {
-      if (!cutter.id || cutter.role === "feature") return [];
+    const linkedStampFeatures = (item: PathMeta): PathMeta[] => {
+      const cutter = item.stampPlate ? derivedFor(item) : item;
+      if (!cutter?.id || !isCutterShape(cutter)) return [];
       return metasRef.current.filter(
         (m) => m.role === "feature" && m.ownerId === cutter.id,
       );
+    };
+
+    /** Features plus the generated cutter, so a plate edit moves the pair together. */
+    const linkedWithCutter = (item: PathMeta): PathMeta[] => {
+      const feats = linkedStampFeatures(item);
+      if (!item.stampPlate) return feats;
+      const cutter = derivedFor(item);
+      return cutter ? [...feats, cutter] : feats;
     };
 
     const featureColor = (m: PathMeta) =>
@@ -748,6 +795,17 @@ export function DrawCanvas({
       m.path.data = { ...(m.path.data || {}), kind: "feature" };
     };
 
+    const styleStampPlate = (m: PathMeta) => {
+      m.path.strokeColor = new scope.Color("#7f1d1d");
+      m.path.strokeWidth = 2.2;
+      m.path.strokeCap = "round";
+      m.path.strokeJoin = "round";
+      m.path.fillColor = null;
+      m.path.opacity = 1;
+      m.path.locked = false;
+      m.path.data = { ...(m.path.data || {}), kind: "stamp-plate" };
+    };
+
     const cutterStroke = (m: PathMeta, grey: boolean) => {
       m.path.strokeColor = new scope.Color(
         grey ? "#9aa3ab" : m.path.closed ? "#c45c26" : "#111",
@@ -755,7 +813,7 @@ export function DrawCanvas({
       m.path.strokeWidth = m.path.closed ? 2.2 : 1.5;
       m.path.fillColor = null;
       m.path.opacity = grey ? 0.55 : 1;
-      m.path.locked = grey;
+      m.path.locked = grey || !!m.derivedFromId;
     };
 
     const maybeSnap = (pt: paper.Point) => {
@@ -949,7 +1007,9 @@ export function DrawCanvas({
       for (const m of metasRef.current) {
         if (!m.path.visible || m.path.locked) continue;
         if (owner) {
-          if (m.role !== "feature" || m.ownerId !== owner.id) continue;
+          const plate = m.stampPlate && m.ownerId === owner.id;
+          const feat = m.role === "feature" && m.ownerId === owner.id;
+          if (!plate && !feat) continue;
         } else if (m.role === "feature") {
           continue;
         }
@@ -958,8 +1018,14 @@ export function DrawCanvas({
         bestD = loc.distance;
         best = m;
       }
-      // Raised outline rim — filled annulus, clickable / not point-editable
-      if (owner && outlineEnabledRef.current && stampRimMetaRef.current) {
+      // Raised outline rim — filled annulus, clickable / not point-editable.
+      // Stamp-first plates are the rim's outer edge, so the annulus must not steal the click.
+      if (
+        owner &&
+        !owner.derivedFromId &&
+        outlineEnabledRef.current &&
+        stampRimMetaRef.current
+      ) {
         const rim = stampRimMetaRef.current;
         const fill = stampRimFillRef.current;
         if (fill) {
@@ -978,9 +1044,13 @@ export function DrawCanvas({
 
     const resolveStampTarget = (): PathMeta | null => {
       const sel = selectedRef.current;
-      if (sel && sel.role !== "feature" && sel.path.closed) return sel;
+      if (sel?.stampPlate) {
+        const derived = derivedFor(sel);
+        if (derived?.path.closed) return derived;
+      }
+      if (sel && isCutterShape(sel) && sel.path.closed) return sel;
       const closed = metasRef.current.filter(
-        (m) => m.role !== "feature" && m.path.closed && m.path.visible,
+        (m) => isCutterShape(m) && m.path.closed && m.path.visible,
       );
       return closed.length === 1 ? closed[0] : null;
     };
@@ -1792,6 +1862,8 @@ export function DrawCanvas({
         raised: m.raised,
         widthMm: m.widthMm,
         filled: m.filled,
+        stampPlate: m.stampPlate,
+        derivedFromId: m.derivedFromId,
       })),
     });
 
@@ -1826,6 +1898,8 @@ export function DrawCanvas({
         raised: m.raised,
         widthMm: m.widthMm,
         filled: m.filled,
+        stampPlate: m.stampPlate,
+        derivedFromId: m.derivedFromId,
       }));
 
     const captureBackgroundBlob = async (): Promise<{
@@ -1921,13 +1995,17 @@ export function DrawCanvas({
           raised: item.raised,
           widthMm: item.widthMm,
           filled: item.filled,
+          stampPlate: item.stampPlate,
+          derivedFromId: item.derivedFromId,
         });
       }
       const ownerId = stampOwnerRef.current?.id;
       stampOwnerRef.current =
         metasRef.current.find((m) => m.id && m.id === ownerId) ?? null;
       for (const m of metasRef.current) {
-        if (m.role === "feature") styleFeature(m);
+        if (m.stampPlate) styleStampPlate(m);
+        else if (m.role === "feature") styleFeature(m);
+        else cutterStroke(m, false);
       }
       clearGizmos();
       clearDrawMarkers();
@@ -1958,7 +2036,8 @@ export function DrawCanvas({
         }
       } else {
         const preferClosed =
-          metasRef.current.find((m) => m.role !== "feature" && m.path.closed) ??
+          metasRef.current.find((m) => m.stampPlate && m.path.closed) ??
+          metasRef.current.find((m) => isCutterShape(m) && m.path.closed) ??
           metasRef.current[metasRef.current.length - 1] ??
           null;
         if (preferClosed) setSelection(preferClosed, true);
@@ -1966,16 +2045,126 @@ export function DrawCanvas({
       if (metasRef.current.some((m) => m.path.closed)) notifyClosedCurve();
     };
 
+    /** Dense sample so the generated cutter stays smooth. The plate Bézier is untouched. */
+    const PLATE_SAMPLE = { flatness: 0.12, minPerCurve: 32, maxPoints: 900 };
+
+    const cutterOutsetPx = () => {
+      const mm = mmPerPxRef.current > 1e-9 ? mmPerPxRef.current : 1;
+      return (wallMmRef.current / 2 + Math.max(0, gapMmRef.current)) / mm;
+    };
+
+    const samplePlatePts = (path: paper.Path) =>
+      ensureCcw(samplePathPoints(path, PLATE_SAMPLE));
+
+    const ringContains = (path: paper.Path, pt: paper.Point) => {
+      if (!path.closed || path.segments.length < 3) return false;
+      let inside = false;
+      const segs = path.segments;
+      for (let i = 0, j = segs.length - 1; i < segs.length; j = i++) {
+        const yi = segs[i].point.y;
+        const yj = segs[j].point.y;
+        const xi = segs[i].point.x;
+        const xj = segs[j].point.x;
+        if (yi > pt.y !== yj > pt.y && pt.x < ((xj - xi) * (pt.y - yi)) / (yj - yi) + xi) {
+          inside = !inside;
+        }
+      }
+      return inside;
+    };
+
+    const applyLoop = (path: paper.Path, loop: { x: number; y: number }[]) => {
+      path.removeSegments();
+      for (const p of loop) path.add(new scope.Point(p.x, p.y));
+      path.closed = true;
+    };
+
+    /**
+     * Rebuild locked cutters from stamp-plate Béziers.
+     * Outset is wall/2 + fit gap, so later slider changes keep the curve on the rim.
+     */
+    const rebuildDerivedCutters = () => {
+      for (const plate of [...metasRef.current]) {
+        if (!plate.stampPlate || !plate.path.closed || plate.path.segments.length < 3) {
+          continue;
+        }
+        ensureId(plate);
+        const pts = samplePlatePts(plate.path);
+        const loop = offsetClosedClipper(
+          pts,
+          cutterOutsetPx(),
+          0.05,
+          JoinType.Miter,
+          8,
+        );
+        if (!loop || loop.length < 3) continue;
+        let cutter = derivedFor(plate);
+        if (!cutter) {
+          const path = new scope.Path({
+            closed: true,
+            strokeCap: "round",
+            strokeJoin: "round",
+            fillColor: null,
+          });
+          applyLoop(path, loop);
+          cutter = {
+            path,
+            raw: cloneRaw(path),
+            smooth: path.segments.map(() => false),
+            lockIndex: 0,
+            noSimplify: true,
+            derivedFromId: plate.id,
+            id: `cut-${plate.id}`,
+          };
+          metasRef.current.push(cutter);
+        } else {
+          applyLoop(cutter.path, loop);
+          cutter.raw = cloneRaw(cutter.path);
+          cutter.smooth = cutter.path.segments.map(() => false);
+          cutter.noSimplify = true;
+        }
+        ensureId(cutter);
+        if (!cutter.stampId) cutter.stampId = `stamp-${cutter.id}`;
+        plate.stampId = cutter.stampId;
+        plate.ownerId = cutter.id;
+        cutterStroke(cutter, !!stampOwnerRef.current && stampOwnerRef.current !== cutter);
+        cutter.path.locked = true;
+        styleStampPlate(plate);
+        if (cutter.id && cutter.stampId) {
+          for (const f of metasRef.current) {
+            if (f.role !== "feature" || f.stampRim) continue;
+            if (f.ownerId && f.ownerId !== cutter.id) continue;
+            const mid = f.path.bounds.center;
+            if (!ringContains(plate.path, mid) && !ringContains(cutter.path, mid)) continue;
+            f.ownerId = cutter.id;
+            f.stampId = cutter.stampId;
+          }
+        }
+      }
+    };
+
     let emitTimer: number | null = null;
     const emitClosedNow = () => {
-      const cutters = metasRef.current.filter((m) => m.role !== "feature");
-      setHasClosedCurve(cutters.some((m) => m.path.closed));
-      setHasCurves(cutters.some((m) => m.path.segments.length >= 2));
+      rebuildDerivedCutters();
+      const cutters = metasRef.current.filter((m) => isCutterShape(m));
+      setHasClosedCurve(
+        cutters.some((m) => m.path.closed) ||
+          metasRef.current.some((m) => m.stampPlate && m.path.closed),
+      );
+      setHasCurves(
+        cutters.some((m) => m.path.segments.length >= 2) ||
+          metasRef.current.some((m) => m.stampPlate && m.path.segments.length >= 2),
+      );
       const sel = selectedRef.current;
       // Prefer the stamp being edited so 3D keeps its plate while drawing features.
+      // A stamp-plate Bézier is never the cutter mesh — its generated cutter is.
       const closed =
-        (stampOwnerRef.current?.path.closed ? stampOwnerRef.current : null) ??
-        (sel && sel.role !== "feature" && sel.path.closed ? sel : null) ??
+        (stampOwnerRef.current &&
+        isCutterShape(stampOwnerRef.current) &&
+        stampOwnerRef.current.path.closed
+          ? stampOwnerRef.current
+          : null) ??
+        (sel && isCutterShape(sel) && sel.path.closed ? sel : null) ??
+        (sel?.stampPlate ? derivedFor(sel) : null) ??
         (sel?.role === "feature"
           ? cutters.find((m) => m.id && m.id === sel.ownerId && m.path.closed)
           : null) ??
@@ -1984,7 +2173,7 @@ export function DrawCanvas({
         null;
       if (!closed) {
         onClosedRef.current(null);
-        onStampFeaturesRef.current(null);
+        onStampFeaturesRef.current(null, null);
         return;
       }
       ensureId(closed);
@@ -1995,9 +2184,11 @@ export function DrawCanvas({
       });
       onClosedRef.current(pts.length >= 3 ? pts : null);
       if (!closed.stampId) {
-        onStampFeaturesRef.current(null);
+        onStampFeaturesRef.current(null, null);
         return;
       }
+      const plate = plateFor(closed);
+      const outlinePx = plate ? samplePlatePts(plate.path) : null;
       const features: StampFeatureIn[] = metasRef.current
         .filter((m) => m.role === "feature" && m.ownerId === closed.id)
         .filter((m) => m.path.segments.length >= 2)
@@ -2012,7 +2203,7 @@ export function DrawCanvas({
           raised: m.raised !== false,
           widthMm: m.widthMm ?? 0.6,
         }));
-      onStampFeaturesRef.current(features);
+      onStampFeaturesRef.current(features, outlinePx);
     };
 
     const clearStampRimPreviews = () => {
@@ -2045,6 +2236,8 @@ export function DrawCanvas({
       for (const host of metasRef.current) {
         if (
           host.role === "feature" ||
+          host.stampPlate ||
+          host.derivedFromId ||
           !host.stampId ||
           !host.path.closed ||
           !host.path.visible ||
@@ -2071,6 +2264,33 @@ export function DrawCanvas({
         outer.clockwise = true;
         const hole = new scope.Path({ insert: false, closed: true });
         for (const p of loops.inner) hole.add(new scope.Point(p.x, p.y));
+        hole.closed = true;
+        hole.clockwise = false;
+        const fill = new scope.CompoundPath({
+          children: [outer, hole],
+          fillColor: new scope.Color("#9aa3ab"),
+          strokeColor: null,
+          strokeWidth: 0,
+          opacity: 0.4,
+          locked: true,
+        });
+        fill.data = { kind: "stamp-rim-preview" };
+        fill.sendToBack();
+        stampRimPreviewRef.current.push(fill);
+      }
+      // Stamp-first: the Bézier itself is the rim's outer edge.
+      if (!outlineEnabledRef.current) return;
+      const mmPlate = mmPerPxRef.current > 1e-9 ? mmPerPxRef.current : 1;
+      for (const plate of metasRef.current) {
+        if (!plate.stampPlate || !plate.path.closed || !plate.path.visible) continue;
+        if (plate.path.segments.length < 3) continue;
+        const wPx = Math.max(0.05, outlineWidthMmRef.current) / mmPlate;
+        const innerLoop = offsetClosedClipper(samplePlatePts(plate.path), -wPx, 0.05);
+        if (!innerLoop || innerLoop.length < 3) continue;
+        const outer = plate.path.clone({ insert: false }) as paper.Path;
+        outer.clockwise = true;
+        const hole = new scope.Path({ insert: false, closed: true });
+        for (const p of innerLoop) hole.add(new scope.Point(p.x, p.y));
         hole.closed = true;
         hole.clockwise = false;
         const fill = new scope.CompoundPath({
@@ -2127,14 +2347,18 @@ export function DrawCanvas({
         }
         return;
       }
-      const pts = samplePathPoints(owner.path, {
-        flatness: 0.4,
-        minPerCurve: 12,
-        maxPoints: 360,
-      });
+      const plate = plateFor(owner);
       const mm = mmPerPxRef.current > 1e-9 ? mmPerPxRef.current : 1;
-      const insetPx = (wallMmRef.current / 2 + Math.max(0, gapMmRef.current)) / mm;
-      const loop = offsetClosedClipper(pts, -insetPx);
+      const loop = plate
+        ? samplePlatePts(plate.path)
+        : offsetClosedClipper(
+            samplePathPoints(owner.path, {
+              flatness: 0.4,
+              minPerCurve: 12,
+              maxPoints: 360,
+            }),
+            -((wallMmRef.current / 2 + Math.max(0, gapMmRef.current)) / mm),
+          );
       if (!loop || loop.length < 3) {
         stampRimMetaRef.current = null;
         if (keepRim) {
@@ -2144,13 +2368,19 @@ export function DrawCanvas({
         }
         return;
       }
-      // Outer plate edge — always kept for the mask hole
-      const path = new scope.Path({
-        closed: true,
-        fillColor: null,
-      });
-      for (const p of loop) path.add(new scope.Point(p.x, p.y));
+      // Outer plate edge — always kept for the mask hole.
+      // Stamp-first uses a clone of the Bézier so the mask matches the curve.
+      const path = plate
+        ? (plate.path.clone() as paper.Path)
+        : new scope.Path({
+            closed: true,
+            fillColor: null,
+          });
+      if (!plate) {
+        for (const p of loop) path.add(new scope.Point(p.x, p.y));
+      }
       path.closed = true;
+      path.fillColor = null;
       path.data = { kind: "stamp-outline" };
 
       if (outlineEnabledRef.current) {
@@ -2165,8 +2395,12 @@ export function DrawCanvas({
           path.visible = true;
           path.locked = true;
 
-          const outer = new scope.Path({ insert: false, closed: true });
-          for (const p of loop) outer.add(new scope.Point(p.x, p.y));
+          const outer = plate
+            ? (plate.path.clone({ insert: false }) as paper.Path)
+            : new scope.Path({ insert: false, closed: true });
+          if (!plate) {
+            for (const p of loop) outer.add(new scope.Point(p.x, p.y));
+          }
           outer.closed = true;
           outer.clockwise = true;
 
@@ -2193,10 +2427,16 @@ export function DrawCanvas({
           path.visible = true;
           path.locked = false;
         }
-      } else {
+      } else if (!plate) {
         path.strokeColor = new scope.Color("#455a64");
         path.strokeWidth = screen(1.4);
         path.dashArray = [screen(6), screen(4)];
+        path.visible = true;
+        path.locked = true;
+      } else {
+        path.strokeColor = null;
+        path.strokeWidth = 0;
+        path.dashArray = [];
         path.visible = true;
         path.locked = true;
       }
@@ -2241,6 +2481,18 @@ export function DrawCanvas({
     };
 
     const refreshStampUi = () => {
+      const sel = selectedRef.current;
+      setCanAddCutterAroundRef.current(
+        !stampOwnerRef.current &&
+          !!sel &&
+          sel.role !== "feature" &&
+          !sel.stampPlate &&
+          !sel.derivedFromId &&
+          !sel.stampId &&
+          !sel.stampRim &&
+          sel.path.closed &&
+          sel.path.segments.length >= 3,
+      );
       if (stampOwnerRef.current) {
         setStampUiRef.current("back");
         return;
@@ -2252,12 +2504,12 @@ export function DrawCanvas({
       }
       // Enabled when a closed curve is selected, or there is exactly one
       // (works in draw/polygon/ellipse too — closing a shape keeps those modes).
-      const sel = selectedRef.current;
       const sole =
         metasRef.current.filter(
-          (m) => m.role !== "feature" && m.path.closed && m.path.visible,
+          (m) => isCutterShape(m) && m.path.closed && m.path.visible,
         ).length === 1;
-      if ((sel && sel === target) || sole) {
+      const plateSelected = !!sel?.stampPlate && derivedFor(sel) === target;
+      if ((sel && sel === target) || plateSelected || sole) {
         setStampUiRef.current(target.stampId ? "edit" : "add");
       } else {
         setStampUiRef.current("off");
@@ -2287,9 +2539,23 @@ export function DrawCanvas({
     };
 
     const syncStampChrome = () => {
+      rebuildDerivedCutters();
       const owner = stampOwnerRef.current;
       for (const m of metasRef.current) {
         ensureId(m);
+        if (m.stampPlate) {
+          const show = !owner || m.ownerId === owner.id;
+          m.path.visible = show;
+          styleStampPlate(m);
+          continue;
+        }
+        if (m.derivedFromId) {
+          const show = !owner || m === owner;
+          m.path.visible = show;
+          cutterStroke(m, !!owner);
+          m.path.locked = true;
+          continue;
+        }
         if (m.role === "feature") {
           if (owner) {
             const show = m.ownerId === owner.id;
@@ -2345,6 +2611,9 @@ export function DrawCanvas({
         owner.path.bringToFront();
         outline?.bringToFront();
         stampRimFillRef.current?.bringToFront();
+        for (const m of metasRef.current) {
+          if (m.stampPlate && m.ownerId === owner.id) m.path.bringToFront();
+        }
       } else {
         // Drop interactive stamp chrome, keep a gray rim preview + gray features
         stampOutlineRef.current?.remove();
@@ -2366,6 +2635,9 @@ export function DrawCanvas({
           if (m.role === "feature" && m.path.visible) m.path.sendToBack();
         }
         for (const rim of stampRimPreviewRef.current) rim.sendToBack();
+        for (const m of metasRef.current) {
+          if (m.stampPlate && m.path.visible) m.path.bringToFront();
+        }
       }
       refreshStampUi();
       refreshFeatureHud();
@@ -2455,7 +2727,8 @@ export function DrawCanvas({
       }
       meta.path.fullySelected = false;
       meta.path.selected = false;
-      if (meta.role === "feature") styleFeature(meta);
+      if (meta.stampPlate) styleStampPlate(meta);
+      else if (meta.role === "feature") styleFeature(meta);
       else {
         meta.path.strokeColor = new scope.Color(
           meta.path.closed ? "#c45c26" : "#111",
@@ -2481,13 +2754,23 @@ export function DrawCanvas({
       const meta = selectedRef.current;
       if (!meta) return;
       // Outline rim is toggled off — not deleted
-      if (meta.stampRim) return;
+      if (meta.stampRim || meta.derivedFromId) return;
       // Never delete the locked cutter while editing its stamp
-      if (stampOwnerRef.current && meta.role !== "feature") return;
+      if (stampOwnerRef.current && meta.role !== "feature" && !meta.stampPlate) return;
       pushUndo();
       if (stampOwnerRef.current === meta) stampOwnerRef.current = null;
       const drop = new Set<PathMeta>([meta]);
-      if (meta.role !== "feature" && meta.id) {
+      if (meta.stampPlate) {
+        const cutter = derivedFor(meta);
+        if (cutter) {
+          if (stampOwnerRef.current === cutter) stampOwnerRef.current = null;
+          drop.add(cutter);
+          for (const m of metasRef.current) {
+            if (m !== meta && m.ownerId === cutter.id) drop.add(m);
+          }
+        }
+      }
+      if (meta.role !== "feature" && meta.id && !meta.stampPlate) {
         for (const m of metasRef.current) {
           if (m.ownerId === meta.id) drop.add(m);
         }
@@ -3690,7 +3973,7 @@ export function DrawCanvas({
                 meta,
                 last: e.point.clone(),
                 started: false,
-                linked: linkedStampFeatures(meta),
+                linked: linkedWithCutter(meta),
               };
             } else if (hit.kind === "scale") {
               const b = selectionPadBounds(meta);
@@ -3702,7 +3985,7 @@ export function DrawCanvas({
                 pivot,
                 startCorner: cornerOf(b, hit.corner).clone(),
                 startRaw: cloneRaw(meta.path),
-                linkedStarts: linkedStampFeatures(meta).map((m) => ({
+                linkedStarts: linkedWithCutter(meta).map((m) => ({
                   meta: m,
                   raw: cloneRaw(m.path),
                 })),
@@ -3716,7 +3999,7 @@ export function DrawCanvas({
                 center,
                 startAngle: e.point.subtract(center).angle,
                 startRaw: cloneRaw(meta.path),
-                linkedStarts: linkedStampFeatures(meta).map((m) => ({
+                linkedStarts: linkedWithCutter(meta).map((m) => ({
                   meta: m,
                   raw: cloneRaw(m.path),
                 })),
@@ -4297,13 +4580,23 @@ export function DrawCanvas({
       ev.preventDefault();
       if (modeRef.current === "edit" && stampOwnerRef.current) {
         const pt = scope.view.viewToProject(new scope.Point(ev.offsetX, ev.offsetY));
+        const plate = metasRef.current.find(
+          (m) =>
+            m.stampPlate &&
+            m.ownerId === stampOwnerRef.current?.id &&
+            (m.path.getNearestLocation(pt)?.distance ?? Infinity) <= screen(8),
+        );
         const meta = metasRef.current.find(
           (m) =>
             m.role === "feature" &&
             m.ownerId === stampOwnerRef.current?.id &&
-            m.path.getNearestLocation(pt)?.distance! <= screen(8),
+            (m.path.getNearestLocation(pt)?.distance ?? Infinity) <= screen(8),
         );
-        if (meta) {
+        if (plate && (!meta || (plate.path.getNearestLocation(pt)?.distance ?? Infinity) <=
+          (meta.path.getNearestLocation(pt)?.distance ?? Infinity))) {
+          setSelection(plate, false);
+          setCtxMenu({ kind: "object", x: ev.clientX, y: ev.clientY, meta: plate });
+        } else if (meta) {
           setSelection(meta, false);
           setCtxMenu({ kind: "stamp", x: ev.clientX, y: ev.clientY, meta });
         }
@@ -4544,7 +4837,7 @@ export function DrawCanvas({
         const owner = stampOwnerRef.current;
         stampOwnerRef.current = null;
         syncStampChrome();
-        setSelection(owner, true);
+        setSelection(plateFor(owner) ?? owner, true);
         return;
       }
       const target = resolveStampTarget();
@@ -4565,7 +4858,7 @@ export function DrawCanvas({
             (selectedRef.current?.role !== "feature"
               ? selectedRef.current
               : null);
-      if (!owner || !owner.stampId) return;
+      if (!owner || !owner.stampId || owner.stampPlate || owner.derivedFromId) return;
       ensureId(owner);
       pushUndo();
       const ownerId = owner.id!;
@@ -4655,7 +4948,7 @@ export function DrawCanvas({
       meta.raw = cloneRaw(meta.path);
       meta.smooth = detectSmoothFlags(meta.path);
       if (meta.role !== "feature") {
-        for (const f of linkedStampFeatures(meta)) {
+        for (const f of linkedWithCutter(meta)) {
           f.path.scale(sx, sy, center);
           f.raw = cloneRaw(f.path);
           f.smooth = detectSmoothFlags(f.path);
@@ -4671,6 +4964,8 @@ export function DrawCanvas({
       if (
         !meta ||
         meta.stampRim ||
+        meta.stampPlate ||
+        meta.derivedFromId ||
         !meta.path.closed ||
         meta.path.segments.length < 3 ||
         Math.abs(mm) < 1e-9
@@ -4697,6 +4992,68 @@ export function DrawCanvas({
       if (meta.role === "feature") styleFeature(meta);
       syncStampChrome();
       setSelection(meta, true);
+    };
+
+    /** Drawn curve stays the stamp rim; a locked cutter is built outside it. */
+    extras.__addCutterAroundOutline = () => {
+      const meta = selectedRef.current;
+      if (
+        !meta ||
+        meta.role === "feature" ||
+        meta.stampPlate ||
+        meta.derivedFromId ||
+        meta.stampId ||
+        meta.stampRim ||
+        !meta.path.closed ||
+        meta.path.segments.length < 3
+      ) {
+        return;
+      }
+      const loop = offsetClosedClipper(
+        samplePlatePts(meta.path),
+        cutterOutsetPx(),
+        0.05,
+        JoinType.Miter,
+        8,
+      );
+      if (!loop || loop.length < 3) return;
+      pushUndo();
+      ensureId(meta);
+      meta.stampPlate = true;
+      syncStampChrome();
+      setSelection(meta, true);
+    };
+
+    extras.__removeCutterAroundOutline = () => {
+      const sel = selectedRef.current;
+      const plate = sel?.stampPlate
+        ? sel
+        : sel?.derivedFromId
+          ? plateFor(sel)
+          : null;
+      if (!plate) return;
+      pushUndo();
+      const cutter = derivedFor(plate);
+      const drop = new Set<PathMeta>();
+      if (cutter) {
+        drop.add(cutter);
+        if (stampOwnerRef.current === cutter) stampOwnerRef.current = null;
+        for (const m of metasRef.current) {
+          if (m.role === "feature" && m.ownerId === cutter.id) drop.add(m);
+        }
+      }
+      for (const m of drop) m.path.remove();
+      metasRef.current = metasRef.current.filter((m) => !drop.has(m));
+      plate.stampPlate = false;
+      plate.stampId = undefined;
+      plate.ownerId = undefined;
+      plate.path.strokeColor = new scope.Color(
+        plate.path.closed ? "#c45c26" : "#111",
+      );
+      plate.path.strokeWidth = plate.path.closed ? 2.2 : 1.5;
+      plate.path.locked = false;
+      syncStampChrome();
+      setSelection(plate, true);
     };
 
     extras.__setSnapGrid = () => {
@@ -4859,7 +5216,10 @@ export function DrawCanvas({
           smooth: detectSmoothFlags(path),
           lockIndex: 0,
         };
-        if (cls.role === "feature") {
+        if (src?.stampPlate) {
+          meta.stampPlate = true;
+          styleStampPlate(meta);
+        } else if (cls.role === "feature") {
           meta.role = "feature";
           meta.raised = cls.raised;
           meta.filled = !!src?.filled;
@@ -4875,7 +5235,7 @@ export function DrawCanvas({
         metas.push(meta);
       }
       // Associate features to the smallest containing closed cutter
-      const cutters = metas.filter((m) => m.role !== "feature" && m.path.closed);
+      const cutters = metas.filter((m) => isCutterShape(m) && m.path.closed);
       for (const c of cutters) {
         ensureId(c);
         const feats = metas.filter((m) => {
@@ -4906,7 +5266,8 @@ export function DrawCanvas({
       }
       syncStampChrome();
       const preferClosed =
-        metas.find((m) => m.role !== "feature" && m.path.closed) ??
+        metas.find((m) => m.stampPlate && m.path.closed) ??
+        metas.find((m) => isCutterShape(m) && m.path.closed) ??
         metas[metas.length - 1];
       setSelection(preferClosed, true);
       syncEmpty();
@@ -4997,6 +5358,17 @@ export function DrawCanvas({
       const paths: ImportedPath[] = [];
       for (const m of metasRef.current) {
         if (m.path.segments.length < 2) continue;
+        if (m.derivedFromId) continue;
+        if (m.stampPlate) {
+          paths.push({
+            closed: m.path.closed,
+            segments: toSegs(m),
+            role: "cutter",
+            stampPlate: true,
+            strokeRgb: STAMP_PLATE_RGB,
+          });
+          continue;
+        }
         if (m.role === "feature") {
           const raised = m.raised !== false;
           paths.push({
@@ -5024,10 +5396,32 @@ export function DrawCanvas({
         for (const m of metasRef.current) {
           if (
             m.role === "feature" ||
+            m.stampPlate ||
             !m.stampId ||
             !m.path.closed ||
             m.path.segments.length < 3
           ) {
+            continue;
+          }
+          if (m.derivedFromId) {
+            const plate = plateFor(m);
+            if (!plate) continue;
+            const outer = samplePlatePts(plate.path);
+            const wPx = Math.max(0.05, outlineWidthMmRef.current) / mm;
+            const inner = offsetClosedClipper(outer, -wPx, 0.05);
+            if (!inner || inner.length < 3) continue;
+            paths.push({
+              closed: true,
+              segments: ptsToSegs(outer),
+              holes: [ptsToSegs(inner)],
+              role: "feature",
+              raised: true,
+              filled: true,
+              stampRim: true,
+              widthMm: outlineWidthMmRef.current,
+              strokeRgb: STAMP_RIM_RGB,
+              strokePt: 0.05,
+            });
             continue;
           }
           const loops = stampRimLoopsPx(
@@ -5530,7 +5924,9 @@ export function DrawCanvas({
     selectedRef.current = meta;
     notifySelectionUi(meta);
     (scope as unknown as ScopeExtras).__setMode?.();
-    if (meta.path.closed) {
+    if (meta.stampPlate) {
+      (scope as unknown as ScopeExtras).__syncStamp?.();
+    } else if (meta.path.closed) {
       onClosedPathChange(
         samplePathPoints(meta.path, {
           flatness: 0.45,
@@ -5548,6 +5944,10 @@ export function DrawCanvas({
       null;
     if (!closed) {
       onClosedPathChange(null);
+      return;
+    }
+    if (closed.stampPlate || closed.derivedFromId) {
+      (scopeRef.current as unknown as ScopeExtras | null)?.__syncStamp?.();
       return;
     }
     onClosedPathChange(
@@ -5575,6 +5975,13 @@ export function DrawCanvas({
       })),
     });
     if (action === "delete") {
+      if (meta.stampPlate) {
+        undoRef.current.pop();
+        closeMenu();
+        selectedRef.current = meta;
+        (scope as unknown as ScopeExtras).__deleteCurrent?.();
+        return;
+      }
       meta.path.remove();
       metasRef.current = metasRef.current.filter((m) => m !== meta);
       const next = metasRef.current[0] ?? null;
@@ -5604,13 +6011,17 @@ export function DrawCanvas({
       selectedRef.current = meta;
       notifySelectionUi(meta);
       (scope as unknown as ScopeExtras).__setMode?.();
-      onClosedPathChange(
-        samplePathPoints(meta.path, {
-          flatness: 0.45,
-          minPerCurve: 16,
-          maxPoints: 400,
-        }),
-      );
+      if (meta.stampPlate) {
+        (scope as unknown as ScopeExtras).__syncStamp?.();
+      } else {
+        onClosedPathChange(
+          samplePathPoints(meta.path, {
+            flatness: 0.45,
+            minPerCurve: 16,
+            maxPoints: 400,
+          }),
+        );
+      }
       onCurveClosed();
       return;
     }
@@ -5633,7 +6044,9 @@ export function DrawCanvas({
     selectedRef.current = meta;
     notifySelectionUi(meta);
     (scope as unknown as ScopeExtras).__setMode?.();
-    if (meta.path.closed) {
+    if (meta.stampPlate) {
+      (scope as unknown as ScopeExtras).__syncStamp?.();
+    } else if (meta.path.closed) {
       onClosedPathChange(
         samplePathPoints(meta.path, {
           flatness: 0.45,
@@ -5849,6 +6262,26 @@ export function DrawCanvas({
             </Tooltip>
           )}
         </Box>
+        {canAddCutterAround && (
+          <Tooltip
+            title="Keep this curve as the stamp outline and build a cutter around it. The Bézier stays editable; the cutter follows wall thickness and fit gap."
+            placement="right"
+          >
+            <Button
+              size="small"
+              variant="outlined"
+              onClick={() =>
+                (
+                  scopeRef.current as unknown as ScopeExtras | null
+                )?.__addCutterAroundOutline?.()
+              }
+              startIcon={<PawPrint size={16} strokeWidth={2} />}
+              sx={{ textTransform: "none", width: "100%" }}
+            >
+              Add cutter
+            </Button>
+          </Tooltip>
+        )}
         {stampUi === "back" && (
           <Box
             sx={{
@@ -6344,7 +6777,34 @@ export function DrawCanvas({
             >
               <ListItemText primary="Flip vertical" />
             </MenuItem>
-            {ctxMenu.meta.path.closed && (
+            {ctxMenu.meta.path.closed &&
+              !ctxMenu.meta.stampPlate &&
+              !ctxMenu.meta.stampId &&
+              ctxMenu.meta.role !== "feature" && (
+                <MenuItem
+                  onClick={() => {
+                    closeMenu();
+                    (
+                      scopeRef.current as unknown as ScopeExtras | null
+                    )?.__addCutterAroundOutline?.();
+                  }}
+                >
+                  <ListItemText primary="Add cutter around outline" />
+                </MenuItem>
+              )}
+            {ctxMenu.meta.stampPlate && (
+              <MenuItem
+                onClick={() => {
+                  closeMenu();
+                  (
+                    scopeRef.current as unknown as ScopeExtras | null
+                  )?.__removeCutterAroundOutline?.();
+                }}
+              >
+                <ListItemText primary="Remove cutter" />
+              </MenuItem>
+            )}
+            {ctxMenu.meta.path.closed && !ctxMenu.meta.stampPlate && (
               <>
                 <Divider />
                 <MenuItem
@@ -6367,7 +6827,7 @@ export function DrawCanvas({
                 >
                   <ListItemText primary="Shrink 0.5 mm" />
                 </MenuItem>
-                {!!ctxMenu.meta.stampId && (
+                {!!ctxMenu.meta.stampId && !ctxMenu.meta.derivedFromId && (
                   <MenuItem
                     onClick={() => {
                       closeMenu();
@@ -6393,7 +6853,34 @@ export function DrawCanvas({
                 <ListItemText primary="Close curve" />
               </MenuItem>
             )}
-            {ctxMenu.meta.path.closed && (
+            {ctxMenu.meta.path.closed &&
+              !ctxMenu.meta.stampPlate &&
+              !ctxMenu.meta.stampId &&
+              ctxMenu.meta.role !== "feature" && (
+                <MenuItem
+                  onClick={() => {
+                    closeMenu();
+                    (
+                      scopeRef.current as unknown as ScopeExtras | null
+                    )?.__addCutterAroundOutline?.();
+                  }}
+                >
+                  <ListItemText primary="Add cutter around outline" />
+                </MenuItem>
+              )}
+            {ctxMenu.meta.stampPlate && (
+              <MenuItem
+                onClick={() => {
+                  closeMenu();
+                  (
+                    scopeRef.current as unknown as ScopeExtras | null
+                  )?.__removeCutterAroundOutline?.();
+                }}
+              >
+                <ListItemText primary="Remove cutter" />
+              </MenuItem>
+            )}
+            {ctxMenu.meta.path.closed && !ctxMenu.meta.stampPlate && (
               <>
                 <MenuItem
                   onClick={() => {
@@ -6415,7 +6902,7 @@ export function DrawCanvas({
                 >
                   <ListItemText primary="Shrink 0.5 mm" />
                 </MenuItem>
-                {!!ctxMenu.meta.stampId && (
+                {!!ctxMenu.meta.stampId && !ctxMenu.meta.derivedFromId && (
                   <MenuItem
                     onClick={() => {
                       closeMenu();

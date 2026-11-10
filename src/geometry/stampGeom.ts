@@ -39,16 +39,22 @@ function largest(paths: PathsD): Vec2[] | null {
 }
 
 /** Inset (negative delta) or outset a closed ring. Returns the largest loop. */
-export function offsetClosedClipper(pts: Vec2[], delta: number): Vec2[] | null {
+export function offsetClosedClipper(
+  pts: Vec2[],
+  delta: number,
+  arcTolerance = 0.15,
+  join: JoinType = JoinType.Round,
+  miterLimit = 2,
+): Vec2[] | null {
   if (pts.length < 3 || Math.abs(delta) < 1e-9) return pts.map((p) => ({ ...p }));
   const out = inflatePathsD(
     [toPath(pts)],
     delta,
-    JoinType.Round,
+    join,
     EndType.Polygon,
+    miterLimit,
     2,
-    2,
-    0.15,
+    arcTolerance,
   );
   return largest(out);
 }

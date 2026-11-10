@@ -117,6 +117,8 @@ export default function App() {
   const [snapCurves, setSnapCurves] = useState(false);
   const [stamp, setStamp] = useState<StampParams>({ ...DEFAULT_STAMP });
   const [stampFeatures, setStampFeatures] = useState<StampFeatureIn[] | null>(null);
+  /** Plate-edge samples when the stamp outline was drawn before the cutter. */
+  const [stampOutlinePx, setStampOutlinePx] = useState<Vec2[] | null>(null);
   const [canvasMode, setCanvasMode] = useState<CanvasMode>("draw");
   const [buildMethod, setBuildMethod] = useState<BuildMethod>(() =>
     loadBuildMethod("clipper2"),
@@ -158,7 +160,8 @@ export default function App() {
       method: BuildMethod,
       features: StampFeatureIn[] | null,
       sp: StampParams,
-    ) => JSON.stringify({ pts, p, method, features, sp }),
+      outlinePx: Vec2[] | null,
+    ) => JSON.stringify({ pts, p, method, features, sp, outlinePx }),
     [],
   );
 
@@ -169,6 +172,7 @@ export default function App() {
       method: BuildMethod,
       features: StampFeatureIn[] | null,
       sp: StampParams,
+      outlinePx: Vec2[] | null,
     ) => {
       try {
         const { group, widthMm, heightMm } = buildCutter(pts, p, method);
@@ -190,6 +194,7 @@ export default function App() {
             features,
             outlineEnabled: sp.outlineEnabled,
             outlineWidthMm: sp.outlineWidthMm,
+            outlinePx,
           });
           root.add(stampGroup);
         }
@@ -197,7 +202,7 @@ export default function App() {
         setMeshGroup(root);
         setSizeReadout({ widthMm, heightMm });
         setError(null);
-        appliedKeyRef.current = sceneKey(pts, p, method, features, sp);
+        appliedKeyRef.current = sceneKey(pts, p, method, features, sp, outlinePx);
         setNeedsApply(false);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to build cutter");
@@ -213,12 +218,13 @@ export default function App() {
       method: BuildMethod,
       features: StampFeatureIn[] | null,
       sp: StampParams,
+      outlinePx: Vec2[] | null,
       delayMs: number,
     ) => {
       if (rebuildTimer.current != null) window.clearTimeout(rebuildTimer.current);
       rebuildTimer.current = window.setTimeout(() => {
         rebuildTimer.current = null;
-        rebuild(pts, p, method, features, sp);
+        rebuild(pts, p, method, features, sp, outlinePx);
       }, delayMs);
     },
     [rebuild],
@@ -258,25 +264,27 @@ export default function App() {
       return;
     }
     if (liveUpdate) {
-      scheduleRebuild(path, params, buildMethod, stampFeatures, stamp, 50);
+      scheduleRebuild(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx, 50);
     } else {
       setNeedsApply(
-        sceneKey(path, params, buildMethod, stampFeatures, stamp) !== appliedKeyRef.current,
+        sceneKey(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx) !==
+          appliedKeyRef.current,
       );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path, hasClosedPath, buildMethod, liveUpdate, scheduleRebuild, sceneKey, stampFeatures, stamp]);
+  }, [path, hasClosedPath, buildMethod, liveUpdate, scheduleRebuild, sceneKey, stampFeatures, stamp, stampOutlinePx]);
 
   useEffect(() => {
     if (!hasClosedPath || !path) return;
     if (liveUpdate) {
-      scheduleRebuild(path, params, buildMethod, stampFeatures, stamp, 120);
+      scheduleRebuild(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx, 120);
     } else {
       setNeedsApply(
-        sceneKey(path, params, buildMethod, stampFeatures, stamp) !== appliedKeyRef.current,
+        sceneKey(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx) !==
+          appliedKeyRef.current,
       );
     }
-  }, [params, buildMethod, liveUpdate, hasClosedPath, path, scheduleRebuild, sceneKey, stamp, stampFeatures]);
+  }, [params, buildMethod, liveUpdate, hasClosedPath, path, scheduleRebuild, sceneKey, stamp, stampFeatures, stampOutlinePx]);
 
   /** Always-defined scale for measure UI (fallback 1 mm per paper unit). */
   const measureMmPerPx =
@@ -538,7 +546,12 @@ export default function App() {
                   stamp={stamp}
                   onStampChange={setStamp}
                   onDraftSaved={setToast}
-                  onStampFeatures={setStampFeatures}
+                  onStampFeatures={(features, outline) => {
+                    setStampFeatures(features);
+                    setStampOutlinePx(
+                      outline && outline.length >= 3 ? outline : null,
+                    );
+                  }}
                   mmPerPx={measureMmPerPx}
                   onMmPerPxChange={setMmPerPx}
                   onClosedPathChange={setPath}
@@ -612,7 +625,8 @@ export default function App() {
                     needsApply={needsApply}
                     onLiveUpdateChange={setLiveUpdate}
                     onApply={() =>
-                      path && rebuild(path, params, buildMethod, stampFeatures, stamp)
+                      path &&
+                        rebuild(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx)
                     }
                   />
                   {wallProfileMode !== "hidden" && (

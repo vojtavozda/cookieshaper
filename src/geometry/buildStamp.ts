@@ -190,6 +190,11 @@ export type BuildStampArgs = {
   /** Raised rim along plate edge (annulus inward from outline). */
   outlineEnabled?: boolean;
   outlineWidthMm?: number;
+  /**
+   * Paper-space plate edge when the stamp outline was drawn first.
+   * Mapped with the cutter frame; skips insetting the cutter.
+   */
+  outlinePx?: Vec2[] | null;
 };
 
 export function buildStamp(args: BuildStampArgs): THREE.Group {
@@ -199,7 +204,10 @@ export function buildStamp(args: BuildStampArgs): THREE.Group {
   const frame = mmFrame(args.cutterPx, args.sizeMm);
   const cutterMm = args.cutterPx.map((p) => mapMm(p, frame));
   const inset = Math.max(0.05, args.wallMm / 2 + Math.max(0, args.gapMm));
-  const outline = offsetClosedClipper(cutterMm, -inset);
+  const outline =
+    args.outlinePx && args.outlinePx.length >= 3
+      ? args.outlinePx.map((p) => mapMm(p, frame))
+      : offsetClosedClipper(cutterMm, -inset);
   if (!outline || outline.length < 3) return group;
 
   const raisedPaths: PathsD = [];

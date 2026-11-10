@@ -99,6 +99,7 @@ export function samplePathPoints(
   const maxPoints = opts?.maxPoints ?? 400;
 
   const pts: { x: number; y: number }[] = [];
+  const anchorAt: number[] = [];
   const curves = path.curves;
   if (!curves.length) {
     return path.segments.map((s) => ({ x: s.point.x, y: s.point.y }));
@@ -108,6 +109,7 @@ export function samplePathPoints(
     const curve = curves[ci];
     // Real corners / polygonal edges: no extra samples on the chord
     if (curve.isStraight()) {
+      anchorAt.push(pts.length);
       const p0 = curve.point1;
       pts.push({ x: p0.x, y: p0.y });
       if (ci === curves.length - 1 && !path.closed) {
@@ -122,6 +124,7 @@ export function samplePathPoints(
     const samples = Math.max(minPerCurve, byLen);
     // Skip last point of each curve (shared with next) except on final open end
     const last = ci === curves.length - 1 && !path.closed ? samples : samples - 1;
+    anchorAt.push(pts.length);
     for (let i = 0; i <= last; i++) {
       const t = i / samples;
       const p = curve.getPointAtTime(t);
@@ -130,10 +133,21 @@ export function samplePathPoints(
   }
 
   if (pts.length <= maxPoints) return pts;
-  const out: { x: number; y: number }[] = [];
-  const step = pts.length / maxPoints;
-  for (let i = 0; i < maxPoints; i++) out.push(pts[Math.floor(i * step)]);
-  return out;
+  // Uniform thinning used to skip segment anchors, so a sharp corner vanished
+  // from the offset cutter. Always keep those points.
+  const anchors = anchorAt.filter((i) => i >= 0 && i < pts.length);
+  if (anchors.length >= maxPoints) return anchors.map((i) => pts[i]);
+  const keep = new Set(anchors);
+  const interior: number[] = [];
+  for (let i = 0; i < pts.length; i++) if (!keep.has(i)) interior.push(i);
+  const budget = maxPoints - anchors.length;
+  if (interior.length > 0 && budget > 0) {
+    const step = interior.length / budget;
+    for (let i = 0; i < budget; i++) {
+      keep.add(interior[Math.min(interior.length - 1, Math.floor(i * step))]);
+    }
+  }
+  return [...keep].sort((a, b) => a - b).map((i) => pts[i]);
 }
 
 export function makeSegmentSmooth(seg: PaperSegment, scope: PaperScope) {
