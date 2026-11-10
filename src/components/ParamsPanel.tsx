@@ -8,12 +8,12 @@ import {
   MenuItem,
   Select,
   Stack,
-  Switch,
   Tooltip,
   Typography,
 } from "@mui/material";
 import DownloadIcon from "@mui/icons-material/Download";
-import RefreshIcon from "@mui/icons-material/Refresh";
+import UndoIcon from "@mui/icons-material/Undo";
+import { PictureInPicture2, X } from "lucide-react";
 import {
   BUILD_METHODS,
   THICKNESS_PRESETS,
@@ -23,6 +23,7 @@ import {
   type SizeReadout,
   type StampParams,
   type ThicknessPresetId,
+  type WallProfileMode,
 } from "../types";
 import { WheelSlider } from "./WheelSlider";
 
@@ -34,20 +35,19 @@ const SHOW_BUILD_METHOD_UI = false;
 type Props = {
   params: CutterParams;
   sizeReadout: SizeReadout | null;
-  liveUpdate: boolean;
-  /** Pending sketch/param changes not yet applied to the 3D view. */
-  needsApply: boolean;
   enabled: boolean;
-  wallProfileVisible: boolean;
+  wallProfileMode: WallProfileMode;
   method: BuildMethod;
   onMethodChange: (m: BuildMethod) => void;
   onChange: (next: CutterParams) => void;
-  onLiveUpdateChange: (v: boolean) => void;
   onThicknessPreset: (id: ThicknessPresetId) => void;
+  /** One-step undo of the last preset click. */
+  canRevertPreset: boolean;
+  onRevertPreset: () => void;
   /** Opens the save dialog (always available; options inside are gated). */
   onDownload: () => void;
-  onApply: () => void;
   onShowWallProfile: () => void;
+  onHideWallProfile: () => void;
   /** Present when the current cutter curve has a stamp. */
   stamp: StampParams | null;
   onStampChange: (next: StampParams) => void;
@@ -116,18 +116,17 @@ function ParamSlider({
 export function ParamsPanel({
   params,
   sizeReadout,
-  liveUpdate,
-  needsApply,
   enabled,
-  wallProfileVisible,
+  wallProfileMode,
   method,
   onMethodChange,
   onChange,
-  onLiveUpdateChange,
   onThicknessPreset,
+  canRevertPreset,
+  onRevertPreset,
   onDownload,
-  onApply,
   onShowWallProfile,
+  onHideWallProfile,
   stamp,
   onStampChange,
 }: Props) {
@@ -141,7 +140,9 @@ export function ParamsPanel({
   const wallHalf = params.wallThicknessMm / 2;
   /** Overhang past the outer wall face (UI); 0 = flush with wall. */
   const flangeOverhang = Math.max(0, params.rimWidthMm - wallHalf);
-  const hasFlange = flangeOverhang > 1e-6;
+  /** Matches 3D: a flange needs both overhang and height. */
+  const hasFlange = flangeOverhang > 1e-6 && params.baseHeightMm > 1e-6;
+  const hasOverhang = flangeOverhang > 1e-6;
 
   const setFlangeOverhang = (overhang: number) => {
     set("rimWidthMm", Math.max(0, overhang) + wallHalf);
@@ -155,6 +156,25 @@ export function ParamsPanel({
       wallThicknessMm: wt,
       rimWidthMm: flangeOverhang + wt / 2,
       knifeTipMm: Math.min(params.knifeTipMm, wt),
+    });
+  };
+
+  /** Overall cutter height, knife included. The stored wall is the part below the knife. */
+  const overallHeight = params.wallHeightMm + params.knifeHeightMm;
+  const setOverallHeight = (h: number) => {
+    const knife = Math.min(params.knifeHeightMm, Math.max(0, h - 0.4));
+    onChange({
+      ...params,
+      knifeHeightMm: knife,
+      wallHeightMm: Math.max(0, h - knife),
+    });
+  };
+  const setKnifeHeight = (kh: number) => {
+    const knife = Math.max(0, Math.min(kh, overallHeight - 0.4));
+    onChange({
+      ...params,
+      knifeHeightMm: knife,
+      wallHeightMm: overallHeight - knife,
     });
   };
 
@@ -178,11 +198,60 @@ export function ParamsPanel({
     >
       <Box sx={{ px: 2, py: 1.5, flexShrink: 0 }}>
         <Typography variant="h6">Perníčkovadlo</Typography>
-        <Typography variant="caption" color="text.secondary">
-          {enabled
-            ? "Tune the cutter profile"
-            : "Draw a closed outline to enable 3D"}
-        </Typography>
+        <Stack direction="row" spacing={0.75} sx={{ mt: 1, alignItems: "center" }}>
+          {THICKNESS_PRESETS.map((p) => (
+            <Tooltip key={p.id} title={p.hint}>
+              <Button
+                fullWidth
+                size="small"
+                variant={activePreset === p.id ? "contained" : "outlined"}
+                onClick={() => onThicknessPreset(p.id)}
+                sx={{ textTransform: "none", minWidth: 0, px: 0.5 }}
+              >
+                {p.label}
+              </Button>
+            </Tooltip>
+          ))}
+          <Tooltip title="Revert last preset">
+            <span>
+              <IconButton
+                size="small"
+                color={canRevertPreset ? "primary" : "default"}
+                aria-label="Revert last preset"
+                disabled={!canRevertPreset}
+                onClick={onRevertPreset}
+                sx={{ "&.Mui-disabled": { opacity: 0.3 } }}
+              >
+                <UndoIcon fontSize="small" />
+              </IconButton>
+            </span>
+          </Tooltip>
+        </Stack>
+        {wallProfileMode === "hidden" ? (
+          <Button
+            fullWidth
+            size="small"
+            variant="outlined"
+            disabled={!enabled}
+            onClick={onShowWallProfile}
+            startIcon={<PictureInPicture2 size={16} strokeWidth={2} />}
+            sx={{ mt: 1, textTransform: "none" }}
+          >
+            Show wall profile
+          </Button>
+        ) : (
+          <Button
+            fullWidth
+            size="small"
+            variant="contained"
+            disabled={!enabled}
+            onClick={onHideWallProfile}
+            startIcon={<X size={16} strokeWidth={2} />}
+            sx={{ mt: 1, textTransform: "none" }}
+          >
+            Hide wall profile
+          </Button>
+        )}
       </Box>
       <Divider />
 
@@ -227,7 +296,7 @@ export function ParamsPanel({
               direction="row"
               sx={{ justifyContent: "space-between", alignItems: "baseline" }}
             >
-              <Typography variant="body2">Scale</Typography>
+              <Typography variant="body2">Size</Typography>
               <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>
                 {sizeLabel}
               </Typography>
@@ -246,6 +315,16 @@ export function ParamsPanel({
         </Tooltip>
 
         <ParamSlider
+          label="Height"
+          value={overallHeight}
+          min={4}
+          max={36}
+          step={0.5}
+          disabled={!enabled}
+          hint="Overall cutter height, including the knife edge"
+          onChange={setOverallHeight}
+        />
+        <ParamSlider
           label="Base width"
           value={flangeOverhang}
           min={0}
@@ -261,7 +340,7 @@ export function ParamsPanel({
           min={0}
           max={4}
           step={0.1}
-          disabled={!enabled || !hasFlange}
+          disabled={!enabled || !hasOverhang}
           hint="Thickness of the bottom flange / foot"
           onChange={(v) => set("baseHeightMm", v)}
         />
@@ -276,22 +355,12 @@ export function ParamsPanel({
           onChange={setWallThickness}
         />
         <ParamSlider
-          label="Wall height"
-          value={params.wallHeightMm}
-          min={4}
-          max={30}
-          step={0.5}
-          disabled={!enabled}
-          hint="Straight wall height below the knife edge"
-          onChange={(v) => set("wallHeightMm", v)}
-        />
-        <ParamSlider
           label="Bevel / fillet radius"
           value={params.filletRadiusMm}
           min={0}
           max={5}
           step={0.1}
-          disabled={!enabled || !hasFlange || params.baseHeightMm <= 0}
+          disabled={!enabled || !hasFlange}
           hint="Rounded transition from flange top into the outer wall"
           onChange={(v) => set("filletRadiusMm", v)}
         />
@@ -302,8 +371,8 @@ export function ParamsPanel({
           max={6}
           step={0.1}
           disabled={!enabled}
-          hint="Tapered cutting tip on top of the wall"
-          onChange={(v) => set("knifeHeightMm", v)}
+          hint="Tapered cutting tip. Overall height stays the same"
+          onChange={setKnifeHeight}
         />
         <ParamSlider
           label="Knife tip width"
@@ -351,94 +420,25 @@ export function ParamsPanel({
             <ParamSlider
               label="Raise height"
               value={stamp.raiseMm}
-              min={0.1}
+              min={0}
               max={4}
               step={0.05}
-              hint="How far raised stamp features protrude from the plate"
+              hint="How far raised stamp features protrude from the plate (0 = flat)"
               onChange={(v) => onStampChange({ ...stamp, raiseMm: v })}
             />
             <ParamSlider
               label="Recess depth"
               value={Math.min(stamp.recessMm, stamp.plateMm)}
-              min={0.1}
+              min={0}
               max={stamp.plateMm}
               step={0.05}
-              hint="How deep recessed stamp features cut into the plate"
+              hint="How deep recessed stamp features cut into the plate (0 = none)"
               onChange={(v) => onStampChange({ ...stamp, recessMm: v })}
             />
             <Divider />
           </>
         )}
 
-        <Stack
-          direction="row"
-          spacing={0.5}
-          sx={{ alignItems: "center", opacity: enabled ? 1 : 0.45 }}
-        >
-          <Switch
-            size="small"
-            checked={liveUpdate}
-            disabled={!enabled}
-            onChange={(_, v) => onLiveUpdateChange(v)}
-          />
-          <Typography variant="body2" sx={{ flex: 1 }}>
-            Live 3D update
-          </Typography>
-          {!liveUpdate && (
-            <Tooltip
-              title={
-                needsApply ? "Apply to 3D view" : "3D view is up to date"
-              }
-            >
-              <span>
-                <IconButton
-                  size="small"
-                  color={needsApply && enabled ? "primary" : "default"}
-                  disabled={!enabled || !needsApply}
-                  onClick={onApply}
-                  aria-label="Apply to 3D view"
-                  sx={{
-                    "&.Mui-disabled": { opacity: 0.35 },
-                  }}
-                >
-                  <RefreshIcon
-                    sx={{
-                      fontSize: 22,
-                      stroke: "currentColor",
-                      strokeWidth: 1.15,
-                    }}
-                  />
-                </IconButton>
-              </span>
-            </Tooltip>
-          )}
-        </Stack>
-
-        <Stack spacing={1}>
-          {!wallProfileVisible && (
-            <Button variant="outlined" disabled={!enabled} onClick={onShowWallProfile}>
-              Show wall profile
-            </Button>
-          )}
-          <Typography variant="caption" color="text.secondary">
-            Presets
-          </Typography>
-          <Stack direction="row" spacing={1}>
-            {THICKNESS_PRESETS.map((p) => (
-              <Tooltip key={p.id} title={p.hint}>
-                <Button
-                  fullWidth
-                  size="small"
-                  variant={activePreset === p.id ? "contained" : "outlined"}
-                  onClick={() => onThicknessPreset(p.id)}
-                  sx={{ textTransform: "none" }}
-                >
-                  {p.label}
-                </Button>
-              </Tooltip>
-            ))}
-          </Stack>
-        </Stack>
       </Stack>
 
       <Box sx={{ px: 2, pb: 2, pt: 1, flexShrink: 0 }}>

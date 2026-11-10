@@ -11,17 +11,22 @@ import {
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import PictureAsPdfOutlinedIcon from "@mui/icons-material/PictureAsPdfOutlined";
-import ContentCutOutlinedIcon from "@mui/icons-material/ContentCutOutlined";
-import ApprovalOutlinedIcon from "@mui/icons-material/ApprovalOutlined";
 import FolderZipOutlinedIcon from "@mui/icons-material/FolderZipOutlined";
 import LayersOutlinedIcon from "@mui/icons-material/LayersOutlined";
+import { LayerArrowUp, PawPrint, Stamp } from "lucide-react";
 import { preloadUnionWasm } from "../geometry/unionSolid";
 
 const BMC_HREF = "https://www.buymeacoffee.com/vojtavozda";
 const BMC_IMG =
   "https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=vojtavozda&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff";
 
-export type DownloadChoice = "sketch" | "cutter" | "stamp" | "assembly" | "zip";
+export type DownloadChoice =
+  | "sketch"
+  | "cutter"
+  | "stamp"
+  | "assembly"
+  | "holder"
+  | "zip";
 
 type Props = {
   open: boolean;
@@ -136,7 +141,7 @@ export function DownloadDialog({
             onClick={() => void run("sketch")}
           />
           <ChoiceButton
-            icon={<ContentCutOutlinedIcon />}
+            icon={<PawPrint size={22} strokeWidth={2} />}
             label="Cutter (STL)"
             hint="3D cookie cutter mesh"
             disabled={!canCutter || (busy && busyChoice !== "cutter")}
@@ -144,7 +149,7 @@ export function DownloadDialog({
             onClick={() => void run("cutter")}
           />
           <ChoiceButton
-            icon={<ApprovalOutlinedIcon />}
+            icon={<Stamp size={22} strokeWidth={2} />}
             label="Stamp (STL)"
             hint="Stamp plate with raised / recessed marks"
             disabled={!canStamp || (busy && busyChoice !== "stamp")}
@@ -160,9 +165,17 @@ export function DownloadDialog({
             onClick={() => void run("assembly")}
           />
           <ChoiceButton
+            icon={<LayerArrowUp size={22} strokeWidth={2} />}
+            label="Stamp holder (STL)"
+            hint="Handle to glue onto the stamp plate"
+            disabled={busy && busyChoice !== "holder"}
+            loading={busyChoice === "holder"}
+            onClick={() => void run("holder")}
+          />
+          <ChoiceButton
             icon={<FolderZipOutlinedIcon />}
             label="Everything (ZIP)"
-            hint="Sketch, separate STLs, and the nested cutter+stamp STL"
+            hint="Sketch, STLs, stamp holder, and nested cutter+stamp"
             disabled={!canZip || (busy && busyChoice !== "zip")}
             loading={busyChoice === "zip"}
             primary

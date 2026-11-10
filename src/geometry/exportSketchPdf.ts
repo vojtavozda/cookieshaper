@@ -21,14 +21,13 @@ function fmt(n: number): string {
   return String(v);
 }
 
-function pathOps(
+function ringOps(
   segs: ImportedSeg[],
   closed: boolean,
   ox: number,
   oy: number,
-  paint: "S" | "B" = "S",
-): string {
-  if (segs.length < 2) return "";
+): string[] {
+  if (segs.length < 2) return [];
   const parts: string[] = [];
   const x = (s: ImportedSeg) => s.point.x - ox;
   const y = (s: ImportedSeg) => s.point.y - oy;
@@ -75,8 +74,34 @@ function pathOps(
     }
     parts.push("h");
   }
+  return parts;
+}
+
+function pathOps(
+  segs: ImportedSeg[],
+  closed: boolean,
+  ox: number,
+  oy: number,
+  paint: "S" | "B" | "f*" = "S",
+  holes?: ImportedSeg[][],
+): string {
+  if (segs.length < 2) return "";
+  const parts = ringOps(segs, closed, ox, oy);
+  if (holes?.length) {
+    for (const hole of holes) {
+      parts.push(...ringOps(hole, true, ox, oy));
+    }
+  }
   parts.push(paint);
   return parts.join("\n") + "\n";
+}
+
+function scaleSegs(segs: ImportedSeg[], k: number): ImportedSeg[] {
+  return segs.map((s) => ({
+    point: { x: s.point.x * k, y: s.point.y * k },
+    handleIn: { x: s.handleIn.x * k, y: s.handleIn.y * k },
+    handleOut: { x: s.handleOut.x * k, y: s.handleOut.y * k },
+  }));
 }
 
 /** Scale paper-space paths into PDF points (true millimetres). */
@@ -84,11 +109,8 @@ function toPdfPoints(paths: ImportedPath[], mmPerPx: number): ImportedPath[] {
   const k = mmPerPx * PT_PER_MM; // paper → pt
   return paths.map((p) => ({
     ...p,
-    segments: p.segments.map((s) => ({
-      point: { x: s.point.x * k, y: s.point.y * k },
-      handleIn: { x: s.handleIn.x * k, y: s.handleIn.y * k },
-      handleOut: { x: s.handleOut.x * k, y: s.handleOut.y * k },
-    })),
+    segments: scaleSegs(p.segments, k),
+    holes: p.holes?.map((h) => scaleSegs(h, k)),
     // widthMm → stroke in PDF points
     strokePt:
       p.strokePt ??
@@ -245,8 +267,18 @@ export function buildSketchPdf(
       `${fmt(rgb[0])} ${fmt(rgb[1])} ${fmt(rgb[2])} rg`,
       `${fmt(w)} w`,
     );
-    const paint = p.filled && p.closed ? "B" : "S";
-    body.push(pathOps(p.segments, p.closed, ox, oy, paint).trimEnd());
+    const hasHoles = !!(p.holes && p.holes.length > 0);
+    // Rim annulus: even-odd fill only. Features: fill+stroke. Else stroke.
+    const paint: "S" | "B" | "f*" = p.stampRim
+      ? "f*"
+      : hasHoles && p.filled
+        ? "f*"
+        : p.filled && p.closed
+          ? "B"
+          : "S";
+    body.push(
+      pathOps(p.segments, p.closed, ox, oy, paint, p.holes).trimEnd(),
+    );
   }
   body.push("Q");
   const stream = body.join("\n") + "\n";

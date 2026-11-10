@@ -73,6 +73,27 @@ export function rimAnnulus(outline: Vec2[], width: number): Vec2[][] {
 }
 
 /**
+ * Paper-space stamp rim loops: plate edge (outer) inset from the cutter by
+ * wall/2 + gap, and the inner edge of the raised rim band.
+ */
+export function stampRimLoopsPx(
+  cutterPts: Vec2[],
+  wallMm: number,
+  gapMm: number,
+  outlineWidthMm: number,
+  mmPerPx: number,
+): { outer: Vec2[]; inner: Vec2[] } | null {
+  if (cutterPts.length < 3 || mmPerPx <= 1e-9) return null;
+  const insetPx = (wallMm / 2 + Math.max(0, gapMm)) / mmPerPx;
+  const outer = offsetClosedClipper(cutterPts, -insetPx);
+  if (!outer || outer.length < 3) return null;
+  const wPx = Math.max(0.05, outlineWidthMm) / mmPerPx;
+  const inner = offsetClosedClipper(outer, -wPx);
+  if (!inner || inner.length < 3) return null;
+  return { outer, inner };
+}
+
+/**
  * Clipper2 arcTolerance (double units, ×10^precision internally).
  * 0 → library default (~0.2% of radius) so round endcaps stay smooth.
  * A fixed 0.15 used to leave open strokes with ~1–2 points per semicircle.

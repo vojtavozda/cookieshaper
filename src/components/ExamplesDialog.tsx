@@ -4,12 +4,6 @@ import {
   DialogContent,
   DialogTitle,
   IconButton,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
   Typography,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
@@ -51,7 +45,7 @@ export function ExamplesDialog({ open, onClose, onPick }: Props) {
     <Dialog
       open={open}
       onClose={onClose}
-      maxWidth="sm"
+      maxWidth="md"
       fullWidth
       slotProps={{
         paper: { sx: { borderRadius: 1.5 } },
@@ -73,65 +67,77 @@ export function ExamplesDialog({ open, onClose, onPick }: Props) {
           <CloseIcon fontSize="small" />
         </IconButton>
       </DialogTitle>
-      <DialogContent sx={{ pt: 0, pb: 2 }}>
-        <TableContainer>
-          <Table size="small" aria-label="Example sketches">
-            <TableHead>
-              <TableRow>
-                <TableCell sx={{ width: 120, borderBottomColor: "divider" }}>
-                  Preview
-                </TableCell>
-                <TableCell sx={{ borderBottomColor: "divider" }}>Name</TableCell>
-                <TableCell sx={{ borderBottomColor: "divider" }}>File</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {SKETCH_EXAMPLES.map((ex) => (
-                <TableRow
-                  key={ex.id}
-                  hover
-                  onClick={() => void pick(ex)}
-                  sx={{
-                    cursor: "pointer",
-                    "&:last-child td": { borderBottom: 0 },
-                  }}
-                >
-                  <TableCell sx={{ py: 1 }}>
-                    <Box
-                      component="img"
-                      src={examplePreviewUrl(ex)}
-                      alt=""
-                      sx={{
-                        width: 104,
-                        height: 65,
-                        objectFit: "contain",
-                        display: "block",
-                        borderRadius: 0.75,
-                        border: 1,
-                        borderColor: "divider",
-                        bgcolor: "#fffaf5",
-                      }}
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                      {ex.title}
-                    </Typography>
-                  </TableCell>
-                  <TableCell>
-                    <Typography
-                      variant="caption"
-                      color="text.secondary"
-                      sx={{ fontFamily: "ui-monospace, monospace" }}
-                    >
-                      {ex.file}
-                    </Typography>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </TableContainer>
+      <DialogContent sx={{ pt: 0.5, pb: 2.5 }}>
+        <Box
+          sx={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 1.5,
+            justifyContent: "flex-start",
+          }}
+        >
+          {SKETCH_EXAMPLES.map((ex) => (
+            <Box
+              key={ex.id}
+              component="button"
+              type="button"
+              onClick={() => void pick(ex)}
+              sx={{
+                all: "unset",
+                cursor: "pointer",
+                width: 148,
+                boxSizing: "border-box",
+                borderRadius: 1,
+                border: 1,
+                borderColor: "divider",
+                bgcolor: "#fffaf5",
+                overflow: "hidden",
+                transition: "border-color 120ms, box-shadow 120ms",
+                "&:hover": {
+                  borderColor: "#c45c26",
+                  boxShadow: "0 1px 4px rgba(196,92,38,0.18)",
+                },
+                "&:focus-visible": {
+                  outline: "2px solid #c45c26",
+                  outlineOffset: 2,
+                },
+              }}
+            >
+              <Box
+                component="img"
+                src={examplePreviewUrl(ex)}
+                alt=""
+                sx={{
+                  width: "100%",
+                  height: 92,
+                  objectFit: "contain",
+                  display: "block",
+                  bgcolor: "#fffaf5",
+                }}
+              />
+              <Typography
+                variant="caption"
+                sx={{
+                  display: "block",
+                  textAlign: "center",
+                  px: 0.75,
+                  py: 0.75,
+                  fontWeight: 600,
+                  color: "text.primary",
+                  lineHeight: 1.25,
+                  userSelect: "none",
+                }}
+              >
+                {ex.title}
+              </Typography>
+            </Box>
+          ))}
+        </Box>
+        {SKETCH_EXAMPLES.length === 0 && (
+          <Typography variant="body2" color="text.secondary">
+            No examples found in /examples (need matching .pdf + .png).
+          </Typography>
+        )}
       </DialogContent>
     </Dialog>
   );

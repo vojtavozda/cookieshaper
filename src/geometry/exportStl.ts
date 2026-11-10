@@ -360,6 +360,23 @@ export async function downloadStampStl(
   );
 }
 
+/** Static stamp-handle STL served from /public. */
+export const HOLDER_STL_URL = "/pernickovadlo_holder.stl";
+export const HOLDER_STL_NAME = "pernickovadlo_holder.stl";
+
+export async function fetchHolderStlBytes(): Promise<Uint8Array> {
+  const res = await fetch(HOLDER_STL_URL);
+  if (!res.ok) throw new Error(`Could not load ${HOLDER_STL_NAME}`);
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+export async function downloadHolderStl(
+  filename = HOLDER_STL_NAME,
+): Promise<SaveResult | false> {
+  const bytes = await fetchHolderStlBytes();
+  return saveBlob(new Blob([bytes], { type: "model/stl" }), filename);
+}
+
 /** ZIP with cutter (+ stamp when present). Optional extra files (e.g. sketch PDF). */
 export async function downloadProjectZip(
   group: THREE.Group,
@@ -387,6 +404,14 @@ export async function downloadProjectZip(
     if (assembly) {
       files.push({ name: "pernicek-cutter-stamp.stl", data: assembly });
     }
+  }
+  try {
+    files.push({
+      name: HOLDER_STL_NAME,
+      data: await fetchHolderStlBytes(),
+    });
+  } catch {
+    // Keep the rest of the ZIP if the static holder asset is missing.
   }
   if (!files.length) return false;
   await yieldToMain();

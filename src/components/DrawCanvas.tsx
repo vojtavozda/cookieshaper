@@ -20,7 +20,8 @@ import {
   Tooltip,
 } from "@mui/material";
 import SaveAltIcon from "@mui/icons-material/SaveAlt";
-import ApprovalOutlinedIcon from "@mui/icons-material/ApprovalOutlined";
+import DeleteOutlineIcon from "@mui/icons-material/DeleteOutlined";
+import { Stamp } from "lucide-react";
 import type { Vec2 } from "../types";
 import type { CanvasMode } from "./ToolRail";
 import { ExamplesDialog } from "./ExamplesDialog";
@@ -55,6 +56,7 @@ import {
   pathsFromPdfFile,
   STAMP_RAISE_RGB,
   STAMP_RECESS_RGB,
+  STAMP_RIM_RGB,
   svgTextFromFile,
   type ImportedPath,
 } from "../geometry/importVector";
@@ -65,7 +67,7 @@ import {
   type SketchPdfBackground,
 } from "../geometry/exportSketchPdf";
 import { ensureCcw } from "../geometry/offset";
-import { offsetClosedClipper } from "../geometry/stampGeom";
+import { offsetClosedClipper, stampRimLoopsPx } from "../geometry/stampGeom";
 import {
   clearSketchDraft,
   loadSketchDraft,
@@ -280,6 +282,8 @@ type ScopeExtras = {
   __setSnapGrid?: () => void;
   __syncStamp?: () => void;
   __toggleStamp?: () => void;
+  /** Remove stamp (features + rim) from a cutter, or the stamp currently being edited. */
+  __removeStamp?: (meta?: PathMeta) => void;
   __setFeatureWidth?: (widthMm: number) => void;
   __setFeatureRaised?: (raised: boolean) => void;
   __toggleFeatureFill?: () => void;
@@ -708,6 +712,8 @@ export function DrawCanvas({
       current: null,
     };
     const stampRimMetaRef: { current: PathMeta | null } = { current: null };
+    /** Gray rim bands shown in cutter-edit mode (not interactive). */
+    const stampRimPreviewRef: { current: paper.Item[] } = { current: [] };
     const stampMaskRef: { current: paper.CompoundPath | null } = { current: null };
     let metaSeq = 1;
     const lastWidthMm = { current: 0.6 };
@@ -2009,6 +2015,11 @@ export function DrawCanvas({
       onStampFeaturesRef.current(features);
     };
 
+    const clearStampRimPreviews = () => {
+      for (const it of stampRimPreviewRef.current) it.remove();
+      stampRimPreviewRef.current = [];
+    };
+
     const clearStampChrome = () => {
       if (selectedRef.current?.stampRim) {
         selectedRef.current = null;
@@ -2023,6 +2034,57 @@ export function DrawCanvas({
       stampRimMetaRef.current = null;
       stampMaskRef.current?.remove();
       stampMaskRef.current = null;
+      clearStampRimPreviews();
+    };
+
+    /** Gray locked rim for cutters that already have a stamp (cutter-edit mode). */
+    const rebuildStampRimPreviews = () => {
+      clearStampRimPreviews();
+      if (stampOwnerRef.current || !outlineEnabledRef.current) return;
+      const mm = mmPerPxRef.current > 1e-9 ? mmPerPxRef.current : 1;
+      for (const host of metasRef.current) {
+        if (
+          host.role === "feature" ||
+          !host.stampId ||
+          !host.path.closed ||
+          !host.path.visible ||
+          host.path.segments.length < 3
+        ) {
+          continue;
+        }
+        const pts = samplePathPoints(host.path, {
+          flatness: 0.4,
+          minPerCurve: 12,
+          maxPoints: 360,
+        });
+        const loops = stampRimLoopsPx(
+          pts,
+          wallMmRef.current,
+          gapMmRef.current,
+          outlineWidthMmRef.current,
+          mm,
+        );
+        if (!loops) continue;
+        const outer = new scope.Path({ insert: false, closed: true });
+        for (const p of loops.outer) outer.add(new scope.Point(p.x, p.y));
+        outer.closed = true;
+        outer.clockwise = true;
+        const hole = new scope.Path({ insert: false, closed: true });
+        for (const p of loops.inner) hole.add(new scope.Point(p.x, p.y));
+        hole.closed = true;
+        hole.clockwise = false;
+        const fill = new scope.CompoundPath({
+          children: [outer, hole],
+          fillColor: new scope.Color("#9aa3ab"),
+          strokeColor: null,
+          strokeWidth: 0,
+          opacity: 0.4,
+          locked: true,
+        });
+        fill.data = { kind: "stamp-rim-preview" };
+        fill.sendToBack();
+        stampRimPreviewRef.current.push(fill);
+      }
     };
 
     const ensureStampRimMeta = (path: paper.Path): PathMeta => {
@@ -2189,15 +2251,13 @@ export function DrawCanvas({
         return;
       }
       // Enabled when a closed curve is selected, or there is exactly one
+      // (works in draw/polygon/ellipse too — closing a shape keeps those modes).
       const sel = selectedRef.current;
       const sole =
         metasRef.current.filter(
           (m) => m.role !== "feature" && m.path.closed && m.path.visible,
         ).length === 1;
-      if (
-        modeRef.current === "edit" &&
-        ((sel && sel === target) || sole)
-      ) {
+      if ((sel && sel === target) || sole) {
         setStampUiRef.current(target.stampId ? "edit" : "add");
       } else {
         setStampUiRef.current("off");
@@ -2267,6 +2327,7 @@ export function DrawCanvas({
         }
       }
       if (owner) {
+        clearStampRimPreviews();
         rebuildStampOutline();
         rebuildStampMask();
         const mask = stampMaskRef.current;
@@ -2285,11 +2346,26 @@ export function DrawCanvas({
         outline?.bringToFront();
         stampRimFillRef.current?.bringToFront();
       } else {
-        clearStampChrome();
+        // Drop interactive stamp chrome, keep a gray rim preview + gray features
+        stampOutlineRef.current?.remove();
+        stampOutlineRef.current = null;
+        stampRimFillRef.current?.remove();
+        stampRimFillRef.current = null;
+        stampRimMetaRef.current = null;
+        stampMaskRef.current?.remove();
+        stampMaskRef.current = null;
+        if (selectedRef.current?.stampRim) {
+          selectedRef.current = null;
+          onHasSelRef.current(false);
+          onSimplifySyncRef.current?.(null);
+          clearXformGizmos();
+        }
+        rebuildStampRimPreviews();
         // Gray features under their cutters
         for (const m of metasRef.current) {
           if (m.role === "feature" && m.path.visible) m.path.sendToBack();
         }
+        for (const rim of stampRimPreviewRef.current) rim.sendToBack();
       }
       refreshStampUi();
       refreshFeatureHud();
@@ -4296,6 +4372,35 @@ export function DrawCanvas({
         finishPolygonOpen();
         ev.preventDefault();
       }
+      // Tool letters (Figma / Illustrator-style). Skip with modifiers.
+      if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.repeat) {
+        const letter = ev.key.length === 1 ? ev.key.toLowerCase() : "";
+        const toolMode =
+          letter === "v"
+            ? ("edit" as const)
+            : letter === "a"
+              ? ("curveEdit" as const)
+              : letter === "b"
+                ? ("draw" as const)
+                : letter === "p"
+                  ? ("polygon" as const)
+                  : letter === "o"
+                    ? ("ellipse" as const)
+                    : letter === "m"
+                      ? ("measure" as const)
+                      : null;
+        if (toolMode) {
+          onModeChangeRef.current(toolMode);
+          ev.preventDefault();
+          return;
+        }
+        if (letter === "i") {
+          setTraceOpen(true);
+          onImagePanelOpenChangeRef.current(true);
+          ev.preventDefault();
+          return;
+        }
+      }
       if ((ev.key === "z" || ev.key === "Z") && (ev.ctrlKey || ev.metaKey)) {
         if (
           !ev.shiftKey &&
@@ -4388,6 +4493,7 @@ export function DrawCanvas({
       rebuildEditGizmos();
       rebuildMeasureDots();
       syncStampChrome();
+      refreshStampUi();
       if (!panRef.current && !spaceRef.current) {
         canvas.style.cursor =
           modeRef.current === "edit" || modeRef.current === "curveEdit"
@@ -4449,6 +4555,36 @@ export function DrawCanvas({
       stampOwnerRef.current = target;
       syncStampChrome();
       setSelection(null, true);
+    };
+
+    extras.__removeStamp = (meta?: PathMeta) => {
+      const owner =
+        meta && meta.role !== "feature"
+          ? meta
+          : stampOwnerRef.current ??
+            (selectedRef.current?.role !== "feature"
+              ? selectedRef.current
+              : null);
+      if (!owner || !owner.stampId) return;
+      ensureId(owner);
+      pushUndo();
+      const ownerId = owner.id!;
+      const drop = metasRef.current.filter(
+        (m) => m.role === "feature" && m.ownerId === ownerId,
+      );
+      for (const m of drop) m.path.remove();
+      metasRef.current = metasRef.current.filter((m) => !drop.includes(m));
+      owner.stampId = undefined;
+      if (stampOwnerRef.current === owner) stampOwnerRef.current = null;
+      if (selectedRef.current && drop.includes(selectedRef.current)) {
+        selectedRef.current = null;
+      }
+      selectedSegmentRef.current = null;
+      selectedPointRef.current = null;
+      clearCurveHover();
+      syncStampChrome();
+      setSelection(owner, true);
+      notifyMaybeEmpty();
     };
 
     extras.__setFeatureWidth = (widthMm: number) => {
@@ -4820,6 +4956,14 @@ export function DrawCanvas({
       const kept: ImportedPath[] = [];
       for (const ip of imported) {
         if (ip.segments.length < 2) continue;
+        // Rim annulus is rebuilt from /StampOutline — skip as a feature path
+        // so old PDFs (no rim) and new ones (with rim) both import cleanly.
+        if (
+          ip.stampRim ||
+          classifyStampColor(ip.strokeRgb).stampRim
+        ) {
+          continue;
+        }
         paths.push(makeSketchPath(ip.segments, ip.closed));
         kept.push(ip);
       }
@@ -4844,6 +4988,12 @@ export function DrawCanvas({
           handleIn: { x: s.handleIn.x, y: s.handleIn.y },
           handleOut: { x: s.handleOut.x, y: s.handleOut.y },
         }));
+      const ptsToSegs = (pts: { x: number; y: number }[]): ImportedPath["segments"] =>
+        pts.map((p) => ({
+          point: { x: p.x, y: p.y },
+          handleIn: { x: 0, y: 0 },
+          handleOut: { x: 0, y: 0 },
+        }));
       const paths: ImportedPath[] = [];
       for (const m of metasRef.current) {
         if (m.path.segments.length < 2) continue;
@@ -4865,6 +5015,44 @@ export function DrawCanvas({
             role: "cutter",
             // Black in PDF for all cutters (closedness is path geometry, not hue)
             strokeRgb: [0, 0, 0],
+          });
+        }
+      }
+      // Raised plate-edge rim (annulus) so PDF matches the canvas / 3D stamp
+      if (outlineEnabledRef.current) {
+        const mm = mmPerPxRef.current > 1e-9 ? mmPerPxRef.current : 1;
+        for (const m of metasRef.current) {
+          if (
+            m.role === "feature" ||
+            !m.stampId ||
+            !m.path.closed ||
+            m.path.segments.length < 3
+          ) {
+            continue;
+          }
+          const loops = stampRimLoopsPx(
+            samplePathPoints(m.path, {
+              flatness: 0.4,
+              minPerCurve: 12,
+              maxPoints: 360,
+            }),
+            wallMmRef.current,
+            gapMmRef.current,
+            outlineWidthMmRef.current,
+            mm,
+          );
+          if (!loops) continue;
+          paths.push({
+            closed: true,
+            segments: ptsToSegs(loops.outer),
+            holes: [ptsToSegs(loops.inner)],
+            role: "feature",
+            raised: true,
+            filled: true,
+            stampRim: true,
+            widthMm: outlineWidthMmRef.current,
+            strokeRgb: STAMP_RIM_RGB,
+            strokePt: 0.05,
           });
         }
       }
@@ -5599,43 +5787,68 @@ export function DrawCanvas({
           width: 168,
         }}
       >
-        <Tooltip
-          title={
-            stampUi === "off"
-              ? "First select a closed curve"
-              : stampUi === "back"
-                ? "Leave stamp editing"
-                : stampUi === "edit"
-                  ? "Edit stamp features on this cutter"
-                  : "Add a stamp that fits inside this cutter"
-          }
-          placement="right"
-        >
-          <span>
-            <Button
-              size="small"
-              variant="contained"
-              disabled={stampUi === "off"}
-              onClick={() =>
-                (
-                  scopeRef.current as unknown as ScopeExtras | null
-                )?.__toggleStamp?.()
-              }
-              startIcon={
-                stampUi === "back" ? undefined : (
-                  <ApprovalOutlinedIcon sx={{ fontSize: 16 }} />
-                )
-              }
-              sx={{ textTransform: "none", width: "100%" }}
-            >
-              {stampUi === "back"
-                ? "Edit cutter"
-                : stampUi === "edit"
-                  ? "Edit stamp"
-                  : "Add stamp"}
-            </Button>
-          </span>
-        </Tooltip>
+        <Box sx={{ display: "flex", gap: 0.5, alignItems: "stretch" }}>
+          <Tooltip
+            title={
+              stampUi === "off"
+                ? "First select a closed curve"
+                : stampUi === "back"
+                  ? "Leave stamp editing"
+                  : stampUi === "edit"
+                    ? "Edit stamp features on this cutter"
+                    : "Add a stamp that fits inside this cutter"
+            }
+            placement="right"
+          >
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <Button
+                size="small"
+                variant="contained"
+                disabled={stampUi === "off"}
+                onClick={() =>
+                  (
+                    scopeRef.current as unknown as ScopeExtras | null
+                  )?.__toggleStamp?.()
+                }
+                startIcon={
+                  stampUi === "back" ? undefined : (
+                    <Stamp size={16} strokeWidth={2} />
+                  )
+                }
+                sx={{ textTransform: "none", width: "100%" }}
+              >
+                {stampUi === "back"
+                  ? "Edit cutter"
+                  : stampUi === "edit"
+                    ? "Edit stamp"
+                    : "Add stamp"}
+              </Button>
+            </span>
+          </Tooltip>
+          {stampUi === "back" && (
+            <Tooltip title="Remove stamp" placement="right">
+              <IconButton
+                size="small"
+                aria-label="Remove stamp"
+                onClick={() =>
+                  (
+                    scopeRef.current as unknown as ScopeExtras | null
+                  )?.__removeStamp?.()
+                }
+                sx={{
+                  border: 1,
+                  borderColor: "divider",
+                  borderRadius: 1,
+                  bgcolor: "rgba(255,255,255,0.94)",
+                  width: 34,
+                  height: 30.75,
+                }}
+              >
+                <DeleteOutlineIcon sx={{ fontSize: 18 }} />
+              </IconButton>
+            </Tooltip>
+          )}
+        </Box>
         {stampUi === "back" && (
           <Box
             sx={{
@@ -6154,6 +6367,18 @@ export function DrawCanvas({
                 >
                   <ListItemText primary="Shrink 0.5 mm" />
                 </MenuItem>
+                {!!ctxMenu.meta.stampId && (
+                  <MenuItem
+                    onClick={() => {
+                      closeMenu();
+                      (
+                        scopeRef.current as unknown as ScopeExtras | null
+                      )?.__removeStamp?.(ctxMenu.meta);
+                    }}
+                  >
+                    <ListItemText primary="Remove stamp" />
+                  </MenuItem>
+                )}
               </>
             )}
           </>
@@ -6190,6 +6415,18 @@ export function DrawCanvas({
                 >
                   <ListItemText primary="Shrink 0.5 mm" />
                 </MenuItem>
+                {!!ctxMenu.meta.stampId && (
+                  <MenuItem
+                    onClick={() => {
+                      closeMenu();
+                      (
+                        scopeRef.current as unknown as ScopeExtras | null
+                      )?.__removeStamp?.(ctxMenu.meta);
+                    }}
+                  >
+                    <ListItemText primary="Remove stamp" />
+                  </MenuItem>
+                )}
               </>
             )}
             <MenuItem onClick={() => applyCurveMenu("delete-segment")}>

@@ -94,9 +94,19 @@ function makePreset(opts: {
   wallThicknessMm: number;
   filletRadiusMm: number;
   knifeHeightMm: number;
+  knifeTipMm: number;
+  /** Overall cutter height including the knife (UI “Height”). */
+  overallHeightMm: number;
 }): { params: CutterParams; stamp: StampParams } {
-  const { baseHeightMm, baseWidthMm, wallThicknessMm, filletRadiusMm, knifeHeightMm } =
-    opts;
+  const {
+    baseHeightMm,
+    baseWidthMm,
+    wallThicknessMm,
+    filletRadiusMm,
+    knifeHeightMm,
+    knifeTipMm,
+    overallHeightMm,
+  } = opts;
   return {
     params: {
       ...DEFAULT_PARAMS,
@@ -105,6 +115,9 @@ function makePreset(opts: {
       rimWidthMm: baseWidthMm + wallThicknessMm / 2,
       filletRadiusMm,
       knifeHeightMm,
+      knifeTipMm,
+      // Stored wall is the straight section under the knife.
+      wallHeightMm: Math.max(0, overallHeightMm - knifeHeightMm),
     },
     stamp: {
       ...DEFAULT_STAMP,
@@ -125,18 +138,22 @@ export const THICKNESS_PRESETS: ThicknessPreset[] = [
       wallThicknessMm: 0.8,
       filletRadiusMm: 0,
       knifeHeightMm: 0,
+      knifeTipMm: 0,
+      overallHeightMm: 12,
     }),
   },
   {
     id: "standard",
     label: "Standard",
-    hint: "2.6 mm base/plate, 1 mm wall, 2 mm bevel, 1 mm knife — everyday use",
+    hint: "2.4 mm base/plate, 0.8 mm wall, 1 mm bevel, 1 mm knife — everyday use",
     ...makePreset({
-      baseHeightMm: 2.6,
-      baseWidthMm: 3,
-      wallThicknessMm: 1,
-      filletRadiusMm: 2,
+      baseHeightMm: 2.4,
+      baseWidthMm: 2.6,
+      wallThicknessMm: 0.8,
+      filletRadiusMm: 1,
       knifeHeightMm: 1,
+      knifeTipMm: 0,
+      overallHeightMm: 12,
     }),
   },
   {
@@ -149,6 +166,8 @@ export const THICKNESS_PRESETS: ThicknessPreset[] = [
       wallThicknessMm: 1.2,
       filletRadiusMm: 2,
       knifeHeightMm: 1.2,
+      knifeTipMm: 0.3,
+      overallHeightMm: 12,
     }),
   },
 ];
@@ -185,6 +204,9 @@ export function matchesThicknessPreset(
     nearlyEq(stamp.outlineWidthMm, s.outlineWidthMm)
   );
 }
+
+/** Wall-profile overlay on the 3D view. */
+export type WallProfileMode = "hidden" | "large";
 
 /** How the 3D cutter solid is built. */
 export type BuildMethod = "current" | "stacked" | "clipper2";

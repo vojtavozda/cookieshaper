@@ -23,6 +23,7 @@ import { buildCutter } from "./geometry/buildCutter";
 import {
   downloadAssemblyStl,
   downloadCutterStl,
+  downloadHolderStl,
   downloadProjectZip,
   downloadStampStl,
 } from "./geometry/exportStl";
@@ -36,6 +37,7 @@ import {
   type StampFeatureIn,
   type StampParams,
   type Vec2,
+  type WallProfileMode,
 } from "./types";
 import {
   loadBuildMethod,
@@ -122,7 +124,11 @@ export default function App() {
   const [lastDrawMode, setLastDrawMode] = useState<
     "draw" | "polygon" | "ellipse"
   >("draw");
-  const [showWallProfile, setShowWallProfile] = useState(true);
+  const [wallProfileMode, setWallProfileMode] = useState<WallProfileMode>("large");
+  const [presetRevert, setPresetRevert] = useState<{
+    params: CutterParams;
+    stamp: StampParams;
+  } | null>(null);
   const [meshGroup, setMeshGroup] = useState<THREE.Group | null>(null);
   const [sizeReadout, setSizeReadout] = useState<SizeReadout | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -299,6 +305,11 @@ export default function App() {
     if (choice === "assembly") {
       const result = mesh ? await downloadAssemblyStl(mesh) : false;
       if (!result) throw new Error("Need both a cutter and a stamp");
+      return result === "saved";
+    }
+    if (choice === "holder") {
+      const result = await downloadHolderStl();
+      if (!result) throw new Error("Could not download stamp holder");
       return result === "saved";
     }
     const extras: { name: string; data: Uint8Array }[] = [];
@@ -536,12 +547,24 @@ export default function App() {
                     setSmoothAvailable(tol != null);
                     if (tol != null) setSimplifyTolerance(tol);
                   }}
-                  onModeChange={setCanvasMode}
+                  onModeChange={(m) => {
+                    if (m === "draw" || m === "polygon" || m === "ellipse")
+                      setLastDrawMode(m);
+                    setCanvasMode(m);
+                  }}
                   onHistoryChange={(u, r) => {
                     setCanUndo(u);
                     setCanRedo(r);
                   }}
-                  onCurveClosed={() => setCanvasMode("edit")}
+                  onCurveClosed={() => {
+                    // Keep freehand / polygon / ellipse active so the next shape
+                    // can be drawn immediately (important in stamp mode).
+                    setCanvasMode((m) =>
+                      m === "draw" || m === "polygon" || m === "ellipse"
+                        ? m
+                        : "edit",
+                    );
+                  }}
                   onCurvesEmpty={() => setCanvasMode(lastDrawMode)}
                   onImportBackground={(url) => {
                     if (bgUrl) URL.revokeObjectURL(bgUrl);
@@ -583,12 +606,30 @@ export default function App() {
             <Box sx={{ flex: 1, minWidth: 0, minHeight: 0, position: "relative" }}>
               {hasClosedPath ? (
                 <>
-                  <Viewer3D group={meshGroup} />
-                  {showWallProfile && (
-                    <Box sx={{ position: "absolute", top: 8, right: 8, zIndex: 3 }}>
+                  <Viewer3D
+                    group={meshGroup}
+                    liveUpdate={liveUpdate}
+                    needsApply={needsApply}
+                    onLiveUpdateChange={setLiveUpdate}
+                    onApply={() =>
+                      path && rebuild(path, params, buildMethod, stampFeatures, stamp)
+                    }
+                  />
+                  {wallProfileMode !== "hidden" && (
+                    <Box
+                      sx={{
+                        position: "absolute",
+                        top: 8,
+                        right: 8,
+                        left: 52,
+                        zIndex: 3,
+                        maxHeight: "calc(100% - 16px)",
+                      }}
+                    >
                       <CrossSection
                         params={params}
-                        onHide={() => setShowWallProfile(false)}
+                        stamp={stampFeatures ? stamp : null}
+                        onHide={() => setWallProfileMode("hidden")}
                       />
                     </Box>
                   )}
@@ -620,13 +661,13 @@ export default function App() {
         <ParamsPanel
           params={params}
           sizeReadout={sizeReadout}
-          liveUpdate={liveUpdate}
-          needsApply={needsApply}
           enabled={hasClosedPath}
-          wallProfileVisible={showWallProfile}
+          wallProfileMode={wallProfileMode}
           method={buildMethod}
           onMethodChange={setBuildMethod}
           onChange={(next) => {
+            // Manual slider edit invalidates the one-step preset revert.
+            setPresetRevert(null);
             setParams(next);
             if (
               pathLongPx != null &&
@@ -635,20 +676,28 @@ export default function App() {
               setMmPerPx(next.sizeMm / pathLongPx);
             }
           }}
-          onLiveUpdateChange={setLiveUpdate}
           onThicknessPreset={(id) => {
             const preset = THICKNESS_PRESETS.find((p) => p.id === id);
             if (!preset) return;
+            setPresetRevert({ params: { ...params }, stamp: { ...stamp } });
             // Keep current Size — it's driven by the drawing / measure
             setParams((p) => ({ ...preset.params, sizeMm: p.sizeMm }));
             setStamp({ ...preset.stamp });
           }}
-          onApply={() =>
-            path && rebuild(path, params, buildMethod, stampFeatures, stamp)
-          }
-          onShowWallProfile={() => setShowWallProfile(true)}
+          canRevertPreset={presetRevert != null}
+          onRevertPreset={() => {
+            if (!presetRevert) return;
+            setParams(presetRevert.params);
+            setStamp(presetRevert.stamp);
+            setPresetRevert(null);
+          }}
+          onShowWallProfile={() => setWallProfileMode("large")}
+          onHideWallProfile={() => setWallProfileMode("hidden")}
           stamp={stampFeatures ? stamp : null}
-          onStampChange={setStamp}
+          onStampChange={(next) => {
+            setPresetRevert(null);
+            setStamp(next);
+          }}
           onDownload={() => setDownloadOpen(true)}
         />
       </Box>

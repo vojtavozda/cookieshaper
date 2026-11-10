@@ -114,7 +114,7 @@ export function ToolRail({
         borderColor: "divider",
       }}
     >
-      <Tooltip title="Edit — move / scale / rotate" placement="right">
+      <Tooltip title="Edit — move / scale / rotate (V)" placement="right">
         <IconButton
           color={mode === "edit" ? "primary" : "default"}
           onClick={() => onModeChange("edit")}
@@ -123,7 +123,10 @@ export function ToolRail({
         </IconButton>
       </Tooltip>
 
-      <Tooltip title="Curve edit — points / handles (right-click menu)" placement="right">
+      <Tooltip
+        title="Curve edit — points / handles (A)"
+        placement="right"
+      >
         <IconButton
           color={mode === "curveEdit" ? "primary" : "default"}
           onClick={() => onModeChange("curveEdit")}
@@ -134,7 +137,7 @@ export function ToolRail({
 
       <RailSep />
 
-      <Tooltip title="Draw freehand" placement="right">
+      <Tooltip title="Draw freehand (B)" placement="right">
         <IconButton
           color={mode === "draw" ? "primary" : "default"}
           onClick={() => onModeChange("draw")}
@@ -143,7 +146,10 @@ export function ToolRail({
         </IconButton>
       </Tooltip>
 
-      <Tooltip title="Polygon (click vertices, drag for smooth handles)" placement="right">
+      <Tooltip
+        title="Polygon — click vertices, drag for smooth handles (P)"
+        placement="right"
+      >
         <IconButton
           color={mode === "polygon" ? "primary" : "default"}
           onClick={() => onModeChange("polygon")}
@@ -153,7 +159,7 @@ export function ToolRail({
       </Tooltip>
 
       <Tooltip
-        title="Ellipse (drag; Ctrl = circle; Shift = from center)"
+        title="Ellipse — drag; Ctrl = circle; Shift = from center (O)"
         placement="right"
       >
         <IconButton
@@ -166,7 +172,7 @@ export function ToolRail({
 
       <RailSep />
 
-      <Tooltip title="Background image / trace curves" placement="right">
+      <Tooltip title="Background image / trace curves (I)" placement="right">
         <IconButton
           color={imagePanelOpen ? "primary" : "default"}
           onClick={onOpenImagePanel}
@@ -187,7 +193,7 @@ export function ToolRail({
         </IconButton>
       </Tooltip>
 
-      <Tooltip title="Measure / set size from a length" placement="right">
+      <Tooltip title="Measure / set size from a length (M)" placement="right">
         <IconButton
           color={mode === "measure" ? "primary" : "default"}
           onClick={() => onModeChange("measure")}

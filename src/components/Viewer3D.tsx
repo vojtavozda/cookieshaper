@@ -4,15 +4,16 @@ import {
   Box,
   ScanBox,
   Grid3x3,
-  Ellipse,
+  PawPrint,
   Slice,
   Frame,
   Sparkles,
   Sun,
+  RefreshCw,
+  Stamp,
   // Aperture, // SSAO (hidden for now)
   // ImageDown, // preview export (hidden for now)
 } from "lucide-react";
-import ApprovalOutlinedIcon from "@mui/icons-material/ApprovalOutlined";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
@@ -30,6 +31,11 @@ import {
 
 type Props = {
   group: THREE.Group | null;
+  liveUpdate: boolean;
+  /** Pending sketch/param changes not yet applied to the 3D view. */
+  needsApply: boolean;
+  onLiveUpdateChange: (v: boolean) => void;
+  onApply: () => void;
 };
 
 type SceneCtx = {
@@ -236,7 +242,13 @@ function disposeViewerObject(root: THREE.Object3D) {
   });
 }
 
-export function Viewer3D({ group }: Props) {
+export function Viewer3D({
+  group,
+  liveUpdate,
+  needsApply,
+  onLiveUpdateChange,
+  onApply,
+}: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<SceneCtx | null>(null);
   const [orthographic, setOrthographic] = useState(() => loadOrthographic());
@@ -550,21 +562,54 @@ export function Viewer3D({ group }: Props) {
         }}
       >
         <Stack spacing={0.15}>
-          {/* Preview export — hidden for now
-          <Tooltip title="Save preview image" placement="right">
+          <Tooltip
+            title={showCutter ? "Hide cutter" : "Show cutter"}
+            placement="right"
+          >
             <IconButton
               size="small"
-              onClick={() => {
-                const ctx = sceneRef.current;
-                if (ctx) exportPreviewPng(ctx);
-              }}
-              aria-label="Save preview image"
+              color={showCutter ? "primary" : "default"}
+              onClick={() => setShowCutter((v) => !v)}
+              aria-label="Toggle cutter"
               sx={lucideBtnSx}
             >
-              <LucideIcon Icon={ImageDown} />
+              <LucideIcon Icon={PawPrint} active={showCutter} />
             </IconButton>
           </Tooltip>
-          */}
+          <Tooltip
+            title={showStamp ? "Hide stamp" : "Show stamp"}
+            placement="right"
+          >
+            <IconButton
+              size="small"
+              color={showStamp ? "primary" : "default"}
+              onClick={() => setShowStamp((v) => !v)}
+              aria-label="Toggle stamp"
+              sx={lucideBtnSx}
+            >
+              <LucideIcon Icon={Stamp} active={showStamp} />
+            </IconButton>
+          </Tooltip>
+          <Tooltip
+            title={
+              highlightTip ? "Hide cutting edge" : "Highlight cutting edge"
+            }
+            placement="right"
+          >
+            <IconButton
+              size="small"
+              color={highlightTip ? "primary" : "default"}
+              onClick={() => setHighlightTip((v) => !v)}
+              aria-label="Toggle cutting edge highlight"
+              sx={lucideBtnSx}
+            >
+              <LucideIcon Icon={Slice} active={highlightTip} />
+            </IconButton>
+          </Tooltip>
+          <Divider
+            flexItem
+            sx={{ width: 28, alignSelf: "center", borderColor: "divider", my: 0.35 }}
+          />
           <Tooltip
             title={orthographic ? "Perspective view" : "Orthographic view"}
             placement="right"
@@ -656,47 +701,27 @@ export function Viewer3D({ group }: Props) {
             sx={{ width: 28, alignSelf: "center", borderColor: "divider", my: 0.35 }}
           />
           <Tooltip
-            title={showCutter ? "Hide cutter" : "Show cutter"}
-            placement="right"
-          >
-            <IconButton
-              size="small"
-              color={showCutter ? "primary" : "default"}
-              onClick={() => setShowCutter((v) => !v)}
-              aria-label="Toggle cutter"
-              sx={lucideBtnSx}
-            >
-              <LucideIcon Icon={Ellipse} active={showCutter} />
-            </IconButton>
-          </Tooltip>
-          <Tooltip
-            title={showStamp ? "Hide stamp" : "Show stamp"}
-            placement="right"
-          >
-            <IconButton
-              size="small"
-              color={showStamp ? "primary" : "default"}
-              onClick={() => setShowStamp((v) => !v)}
-              aria-label="Toggle stamp"
-              sx={lucideBtnSx}
-            >
-              <ApprovalOutlinedIcon fontSize="small" />
-            </IconButton>
-          </Tooltip>
-          <Tooltip
             title={
-              highlightTip ? "Hide cutting edge" : "Highlight cutting edge"
+              liveUpdate
+                ? "Live 3D update on"
+                : needsApply
+                  ? "Apply to 3D view"
+                  : "Live 3D update off"
             }
             placement="right"
           >
             <IconButton
               size="small"
-              color={highlightTip ? "primary" : "default"}
-              onClick={() => setHighlightTip((v) => !v)}
-              aria-label="Toggle cutting edge highlight"
+              color={liveUpdate || needsApply ? "primary" : "default"}
+              onClick={() => {
+                if (liveUpdate) onLiveUpdateChange(false);
+                else if (needsApply) onApply();
+                else onLiveUpdateChange(true);
+              }}
+              aria-label="Live 3D update"
               sx={lucideBtnSx}
             >
-              <LucideIcon Icon={Slice} active={highlightTip} />
+              <LucideIcon Icon={RefreshCw} active={liveUpdate || needsApply} />
             </IconButton>
           </Tooltip>
         </Stack>
