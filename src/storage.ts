@@ -1,4 +1,10 @@
-import { DEFAULT_PARAMS, type BuildMethod, type CutterParams } from "./types";
+import {
+  DEFAULT_PARAMS,
+  type BuildMethod,
+  type CutterParams,
+  type WallProfileMode,
+} from "./types";
+import { DEFAULT_PROJECT_NAME, projectDisplayName } from "./projectName";
 
 const PARAMS_KEY = "pernickovac.params";
 const METHOD_KEY = "pernickovac.buildMethod";
@@ -69,6 +75,27 @@ export function saveSnapGrid(on: boolean) {
 
 const ORTHO_KEY = "pernickovac.orthographic";
 const TIP_HL_KEY = "pernickovac.highlightTip";
+const WALL_PROFILE_KEY = "pernickovac.wallProfile";
+
+export function loadWallProfileMode(
+  fallback: WallProfileMode = "hidden",
+): WallProfileMode {
+  try {
+    const v = localStorage.getItem(WALL_PROFILE_KEY);
+    if (v === "hidden" || v === "large") return v;
+  } catch {
+    /* ignore */
+  }
+  return fallback;
+}
+
+export function saveWallProfileMode(mode: WallProfileMode) {
+  try {
+    localStorage.setItem(WALL_PROFILE_KEY, mode);
+  } catch {
+    /* ignore */
+  }
+}
 
 export function loadOrthographic(): boolean {
   try {
@@ -103,6 +130,9 @@ export function saveHighlightTip(on: boolean) {
 }
 
 const WIRE_KEY = "pernickovac.wireframe";
+const SHOW_COOKIE_KEY = "pernickovac.showCookie";
+const EDGE_HL_KEY = "pernickovac.edgeHighlights";
+const COOKIE_EDGE_HL_KEY = "pernickovac.cookieEdgeHighlights";
 
 export function loadWireframe(): boolean {
   try {
@@ -115,6 +145,58 @@ export function loadWireframe(): boolean {
 export function saveWireframe(on: boolean) {
   try {
     localStorage.setItem(WIRE_KEY, on ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}
+
+export function loadShowCookie(): boolean {
+  try {
+    return localStorage.getItem(SHOW_COOKIE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function saveShowCookie(on: boolean) {
+  try {
+    localStorage.setItem(SHOW_COOKIE_KEY, on ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Edge overlays in cutter/stamp view (default on). */
+export function loadEdgeHighlights(): boolean {
+  try {
+    const v = localStorage.getItem(EDGE_HL_KEY);
+    if (v == null) return true;
+    return v === "1";
+  } catch {
+    return true;
+  }
+}
+
+export function saveEdgeHighlights(on: boolean) {
+  try {
+    localStorage.setItem(EDGE_HL_KEY, on ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Edge overlays in cookie view (default off). */
+export function loadCookieEdgeHighlights(): boolean {
+  try {
+    return localStorage.getItem(COOKIE_EDGE_HL_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function saveCookieEdgeHighlights(on: boolean) {
+  try {
+    localStorage.setItem(COOKIE_EDGE_HL_KEY, on ? "1" : "0");
   } catch {
     /* ignore */
   }
@@ -199,4 +281,104 @@ export function saveSplitLayout(layout: SplitLayout) {
   } catch {
     /* ignore */
   }
+}
+
+const PROJECT_NAME_KEY = "pernickovac.projectName";
+const COFFEE_FOLLOW_SHOWS_KEY = "pernickovac.coffeeFollowShows";
+const COFFEE_FOLLOW_HIDE_KEY = "pernickovac.coffeeFollowHide";
+
+/** Canvas project title used for downloads (default Pernickovadlo). */
+export function loadProjectName(): string {
+  try {
+    const v = localStorage.getItem(PROJECT_NAME_KEY);
+    if (v == null || !v.trim()) return DEFAULT_PROJECT_NAME;
+    return projectDisplayName(v);
+  } catch {
+    return DEFAULT_PROJECT_NAME;
+  }
+}
+
+export function saveProjectName(name: string) {
+  try {
+    localStorage.setItem(PROJECT_NAME_KEY, projectDisplayName(name));
+  } catch {
+    /* ignore */
+  }
+}
+
+const SKETCH_TABS_BAR_VISIBLE_KEY = "pernickovac.sketchTabsBarVisible";
+
+/** Whether the full-width sketch tab strip is shown. */
+export function loadSketchTabsBarVisible(): boolean {
+  try {
+    const v = localStorage.getItem(SKETCH_TABS_BAR_VISIBLE_KEY);
+    if (v === null) return true;
+    return v !== "0";
+  } catch {
+    return true;
+  }
+}
+
+export function saveSketchTabsBarVisible(visible: boolean) {
+  try {
+    localStorage.setItem(SKETCH_TABS_BAR_VISIBLE_KEY, visible ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}
+
+const CLOSE_TAB_CONFIRM_HIDE_KEY = "pernickovac.closeTabConfirmHide";
+
+/** Skip the “delete this sketch tab?” confirmation. */
+export function loadCloseTabConfirmHidden(): boolean {
+  try {
+    return localStorage.getItem(CLOSE_TAB_CONFIRM_HIDE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function saveCloseTabConfirmHidden(hidden: boolean) {
+  try {
+    localStorage.setItem(CLOSE_TAB_CONFIRM_HIDE_KEY, hidden ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}
+
+/** User opted out of the post-download coffee / issue dialog. */
+export function loadCoffeeFollowUpHidden(): boolean {
+  try {
+    return localStorage.getItem(COFFEE_FOLLOW_HIDE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function saveCoffeeFollowUpHidden(hidden: boolean) {
+  try {
+    localStorage.setItem(COFFEE_FOLLOW_HIDE_KEY, hidden ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}
+
+export function loadCoffeeFollowUpShows(): number {
+  try {
+    const n = Number(localStorage.getItem(COFFEE_FOLLOW_SHOWS_KEY));
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Bump and persist how many times the follow-up dialog was shown. */
+export function bumpCoffeeFollowUpShows(): number {
+  const next = loadCoffeeFollowUpShows() + 1;
+  try {
+    localStorage.setItem(COFFEE_FOLLOW_SHOWS_KEY, String(next));
+  } catch {
+    /* ignore */
+  }
+  return next;
 }

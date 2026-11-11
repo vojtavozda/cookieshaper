@@ -25,6 +25,8 @@ export type ImportedPath = {
   /** Classified stamp role (set by our PDF round-trip / color heuristic). */
   role?: "cutter" | "feature";
   raised?: boolean;
+  /** Cuts raised and recessed marks in this area. */
+  hole?: boolean;
   widthMm?: number;
   /** Raised plate-edge rim — visual only; rebuilt from StampOutline on import. */
   stampRim?: boolean;
@@ -49,6 +51,8 @@ export const STAMP_RIM_RGB: [number, number, number] = [0.62, 0.16, 0.16];
  * Far from black, feature red, and rim red so older PDFs stay cutters.
  */
 export const STAMP_PLATE_RGB: [number, number, number] = [0.05, 0.42, 0.38];
+/** Hole cut out of raised and recessed marks. Purple, away from red/blue/plate. */
+export const STAMP_HOLE_RGB: [number, number, number] = [0.36, 0.2, 0.55];
 
 function colorDist(
   a: [number, number, number],
@@ -66,12 +70,16 @@ export function classifyStampColor(
 ): {
   role: "cutter" | "feature";
   raised: boolean;
+  hole?: boolean;
   stampRim?: boolean;
   stampPlate?: boolean;
 } {
   if (!rgb) return { role: "cutter", raised: true };
   const [r, g, b] = rgb;
   // Exact / near matches for our own export colors first
+  if (colorDist(rgb, STAMP_HOLE_RGB) < 0.12) {
+    return { role: "feature", raised: true, hole: true };
+  }
   if (colorDist(rgb, STAMP_PLATE_RGB) < 0.08) {
     return { role: "cutter", raised: true, stampPlate: true };
   }
@@ -559,7 +567,84 @@ export type PdfImportResult = {
   stampOutlineEnabled: boolean | null;
   /** Outline rim width from `/StampOutlineWidthMm` when present. */
   stampOutlineWidthMm: number | null;
+  /** Project title from PDF `/Title` when present (Unicode). */
+  projectName: string | null;
 };
+
+/** Decode a PDF Info text string: hex `<FEFF…>` (UTF-16BE) or literal `(…)`. */
+function decodePdfInfoText(raw: string): string | null {
+  const s = raw.trim();
+  if (s.startsWith("<") && s.endsWith(">")) {
+    const hex = s.slice(1, -1).replace(/\s+/g, "");
+    if (hex.length < 2 || hex.length % 2 !== 0) return null;
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+      const n = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+      if (!Number.isFinite(n)) return null;
+      bytes[i] = n;
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+      let out = "";
+      for (let i = 2; i + 1 < bytes.length; i += 2) {
+        const unit = (bytes[i] << 8) | bytes[i + 1];
+        out += String.fromCharCode(unit);
+      }
+      return out;
+    }
+    return new TextDecoder("latin1").decode(bytes);
+  }
+  if (s.startsWith("(") && s.endsWith(")")) {
+    let out = "";
+    const body = s.slice(1, -1);
+    for (let i = 0; i < body.length; i++) {
+      const ch = body[i];
+      if (ch !== "\\") {
+        out += ch;
+        continue;
+      }
+      const n = body[i + 1];
+      if (n === "n") {
+        out += "\n";
+        i++;
+      } else if (n === "r") {
+        out += "\r";
+        i++;
+      } else if (n === "t") {
+        out += "\t";
+        i++;
+      } else if (n === "(" || n === ")" || n === "\\") {
+        out += n;
+        i++;
+      } else if (n >= "0" && n <= "7") {
+        let oct = n;
+        i++;
+        for (let k = 0; k < 2 && i + 1 < body.length; k++) {
+          const d = body[i + 1];
+          if (d < "0" || d > "7") break;
+          oct += d;
+          i++;
+        }
+        out += String.fromCharCode(parseInt(oct, 8));
+      } else if (n != null) {
+        out += n;
+        i++;
+      }
+    }
+    return out;
+  }
+  return null;
+}
+
+/** `/Title` written by our exporter (UTF-16BE hex or literal). */
+export function pdfProjectName(data: Uint8Array): string | null {
+  const text = new TextDecoder("latin1").decode(data);
+  const m = text.match(/\/Title\s*(<(?:[0-9A-Fa-f\s]+)>|\((?:\\.|[^\\)])*\))/);
+  if (!m) return null;
+  const decoded = decodePdfInfoText(m[1]);
+  if (!decoded) return null;
+  const cleaned = decoded.replace(/[\u0000-\u001f]+/g, "").replace(/\s+/g, " ").trim();
+  return cleaned ? cleaned.slice(0, 120) : null;
+}
 
 /** `/StampGapMm` written by our exporter. */
 export function pdfStampGapMm(data: Uint8Array): number | null {
@@ -697,6 +782,7 @@ export async function pathsFromPdf(data: Uint8Array): Promise<PdfImportResult> {
     stampGapMm: pdfStampGapMm(data),
     stampOutlineEnabled: pdfStampOutlineEnabled(data),
     stampOutlineWidthMm: pdfStampOutlineWidthMm(data),
+    projectName: pdfProjectName(data),
   };
 }
 

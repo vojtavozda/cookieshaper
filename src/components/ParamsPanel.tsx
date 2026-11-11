@@ -82,7 +82,8 @@ function ParamSlider({
       >
         <Typography variant="body2">{label}</Typography>
         <Typography variant="caption" color="text.secondary">
-          {value.toFixed(step < 0.1 ? 2 : step < 1 ? 1 : 0)} {unit}
+          {value.toFixed(step < 0.1 ? 2 : step < 1 ? 1 : 0)}
+          {unit ? ` ${unit}` : ""}
         </Typography>
       </Stack>
       <WheelSlider
@@ -197,7 +198,7 @@ export function ParamsPanel({
       }}
     >
       <Box sx={{ px: 2, py: 1.5, flexShrink: 0 }}>
-        <Typography variant="h6">Perníčkovadlo</Typography>
+        {/* <Typography variant="h6">Perníčkovadlo</Typography> */}
         <Stack direction="row" spacing={0.75} sx={{ mt: 1, alignItems: "center" }}>
           {THICKNESS_PRESETS.map((p) => (
             <Tooltip key={p.id} title={p.hint}>
@@ -285,6 +286,19 @@ export function ParamsPanel({
             </Select>
           </FormControl>
         )}
+
+        <ParamSlider
+          label="3D mesh quality"
+          value={params.meshQuality}
+          min={1}
+          max={5}
+          step={1}
+          unit=""
+          hint="Smooth curves become short straight segments in the 3D model. Higher keeps more of each curve (smoother, heavier mesh). 3 is the default."
+          onChange={(v) => set("meshQuality", v)}
+        />
+
+        <Divider />
 
         <Tooltip
           title="Longer side of the outline bounding box (aspect ratio kept)"
@@ -435,7 +449,6 @@ export function ParamsPanel({
               hint="How deep recessed stamp features cut into the plate (0 = none)"
               onChange={(v) => onStampChange({ ...stamp, recessMm: v })}
             />
-            <Divider />
           </>
         )}
 

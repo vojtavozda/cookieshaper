@@ -25,3 +25,13 @@ React · TypeScript · Vite · MUI · Paper.js · three.js · Clipper2
 ## License
 
 See [LICENSE](./LICENSE).
+
+## Support
+
+Do you like this project?
+
+<a href="https://www.buymeacoffee.com/vojtavozda" target="_blank">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png"
+       alt="Buy Me A Coffee"
+       height="50">
+</a>

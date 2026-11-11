@@ -12,6 +12,7 @@ import {
   type PathsD,
 } from "clipper2-ts";
 import type { CutterParams, Vec2 } from "../types";
+import { meshFidelity } from "./pathEdit";
 import { ensureCcw, signedArea } from "./offset";
 
 const cutterMat = () =>
@@ -109,8 +110,21 @@ function filletReach(h: number, radius: number): number {
   return radius * (1 - Math.sqrt(Math.max(0, u * (2 - u))));
 }
 
-function inflate(mid: Vec2[], delta: number, join: JoinType): PathsD {
-  return inflatePathsD([toPath(mid)], delta, join, EndType.Polygon, 2, 3, 0.15);
+function inflate(
+  mid: Vec2[],
+  delta: number,
+  join: JoinType,
+  arcMm: number,
+): PathsD {
+  return inflatePathsD(
+    [toPath(mid)],
+    delta,
+    join,
+    EndType.Polygon,
+    2,
+    3,
+    arcMm,
+  );
 }
 
 /**
@@ -118,6 +132,7 @@ function inflate(mid: Vec2[], delta: number, join: JoinType): PathsD {
  * Joins and self-intersections (sharp concave Vs) are resolved by the clipper.
  */
 export function addClipperBody(group: THREE.Group, mid: Vec2[], params: CutterParams) {
+  const arcMm = meshFidelity(params.meshQuality).arcMm;
   const half = params.wallThicknessMm / 2;
   const rim = Math.max(0, params.rimWidthMm);
   const baseH = Math.max(0, params.baseHeightMm);
@@ -133,7 +148,7 @@ export function addClipperBody(group: THREE.Group, mid: Vec2[], params: CutterPa
       EndType.Joined,
       2,
       3,
-      0.15,
+      arcMm,
     );
     addRings(group, stroke, wallH, 0);
   }
@@ -141,7 +156,7 @@ export function addClipperBody(group: THREE.Group, mid: Vec2[], params: CutterPa
   if (wantFlange) {
     // Same Round inflate as the bevel's outer slices (not Miter) so the flange
     // rim matches the stacked bevel contour in sharp corners.
-    const grown = inflate(mid, rim, JoinType.Round);
+    const grown = inflate(mid, rim, JoinType.Round, arcMm);
     const flange = differenceD(grown, [toPath(mid)], FillRule.NonZero, 3);
     addRings(group, flange, baseH, 0);
   }
@@ -156,8 +171,8 @@ export function addClipperBody(group: THREE.Group, mid: Vec2[], params: CutterPa
       const h0 = i * dh;
       const reach = filletReach(h0, radius);
       if (reach < 0.05) continue;
-      const outer = inflate(mid, half + reach, JoinType.Round);
-      const inner = inflate(mid, half, JoinType.Round);
+      const outer = inflate(mid, half + reach, JoinType.Round, arcMm);
+      const inner = inflate(mid, half, JoinType.Round, arcMm);
       const slab = differenceD(outer, inner, FillRule.NonZero, 3);
       addRings(group, slab, dh, baseH + h0);
     }
@@ -176,6 +191,7 @@ export function addStackedKnifeClipper(
   knifeHeight: number,
   layerMm: number,
   tipWidthMm: number,
+  arcMm = 0.15,
 ) {
   if (knifeHeight <= 1e-3 || half <= 1e-3) return;
   const tipHalf = Math.min(half, Math.max(0, tipWidthMm / 2));
@@ -189,16 +205,16 @@ export function addStackedKnifeClipper(
     const t = Math.min(1, Math.max(0, h0 / knifeHeight));
     const halfT = tipHalf + (half - tipHalf) * (1 - t);
     if (halfT < 0.025) continue;
-    // Miter keeps the sketch corner angle on the cutting edge.
-    // (Round joins arc the tip and add vertices that aren't in the curve.)
+    // Same round join as the wall. A miter corner sits outside that arc
+    // and leaves a lip over the wall, worst on the lowest knife slice.
     const stroke = inflatePathsD(
       [toPath(mid)],
       halfT,
-      JoinType.Miter,
+      JoinType.Round,
       EndType.Joined,
       2,
       3,
-      0.15,
+      arcMm,
     );
     tipMeshes = addRings(group, stroke, dh, z0 + h0);
   }

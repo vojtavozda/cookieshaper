@@ -27,18 +27,25 @@ export type CutterParams = {
    * collapses into stacked single-line walls in the slicer. Clamped to wall thickness.
    */
   knifeTipMm: number;
+  /**
+   * How finely smooth curves are sampled into the 3D mesh (1–5).
+   * 2 matches the original density; higher keeps more of each Bézier.
+   */
+  meshQuality: number;
 };
 
+/** Matches the “Standard” thickness preset (size / mesh quality are independent). */
 export const DEFAULT_PARAMS: CutterParams = {
   sizeMm: 80,
-  rimWidthMm: 4,
-  baseHeightMm: 3,
+  rimWidthMm: 2.6 + 0.8 / 2,
+  baseHeightMm: 2.4,
   wallThicknessMm: 0.8,
-  wallHeightMm: 12,
-  filletRadiusMm: 2,
+  wallHeightMm: 11,
+  filletRadiusMm: 1,
   bevelLayerMm: 0.2,
-  knifeHeightMm: 0.8,
-  knifeTipMm: 0.3,
+  knifeHeightMm: 1,
+  knifeTipMm: 0,
+  meshQuality: 3,
 };
 
 export type SizeReadout = { widthMm: number; heightMm: number };
@@ -49,6 +56,8 @@ export type StampFeatureIn = {
   closed: boolean;
   filled: boolean;
   raised: boolean;
+  /** Subtracts this area from both raised and recessed marks. */
+  hole?: boolean;
   widthMm: number;
 };
 
@@ -63,9 +72,10 @@ export type StampParams = {
   outlineWidthMm: number;
 };
 
+/** Matches the “Standard” thickness preset plate. */
 export const DEFAULT_STAMP: StampParams = {
   gapMm: 0.5,
-  plateMm: 3,
+  plateMm: 2.4,
   raiseMm: 2,
   recessMm: 1,
   outlineEnabled: true,
@@ -195,13 +205,11 @@ export function matchesThicknessPreset(
   if (!cutterOk) return false;
   if (!stamp) return nearlyEq(params.baseHeightMm, preset.stamp.plateMm);
   const s = preset.stamp;
+  // gapMm and raised outline are independent of thickness presets.
   return (
-    nearlyEq(stamp.gapMm, s.gapMm) &&
     nearlyEq(stamp.plateMm, s.plateMm) &&
     nearlyEq(stamp.raiseMm, s.raiseMm) &&
-    nearlyEq(stamp.recessMm, s.recessMm) &&
-    stamp.outlineEnabled === s.outlineEnabled &&
-    nearlyEq(stamp.outlineWidthMm, s.outlineWidthMm)
+    nearlyEq(stamp.recessMm, s.recessMm)
   );
 }
 

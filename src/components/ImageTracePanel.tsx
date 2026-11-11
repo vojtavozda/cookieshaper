@@ -199,139 +199,130 @@ export function ImageTracePanel({
             e.target.value = "";
           }}
         />
-        {/* <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10, lineHeight: 1.3 }}>
-          SVG/PDF → editable curves. PNG/JPG → threshold tracing. Paste (Ctrl+V) works too.
-        </Typography> */}
-
-        <FormControlLabel
-          disabled={!hasImage}
-          control={
-            <Switch
-              size="small"
-              checked={showBackground}
-              onChange={(_, v) => onShowBackgroundChange(v)}
+        {hasImage && (
+          <>
+            <FormControlLabel
+              control={
+                <Switch
+                  size="small"
+                  checked={showBackground}
+                  onChange={(_, v) => onShowBackgroundChange(v)}
+                />
+              }
+              label={<Typography variant="caption">Show image</Typography>}
+              sx={{ ml: 0, mr: 0 }}
             />
-          }
-          label={<Typography variant="caption">Show image</Typography>}
-          sx={{ ml: 0, mr: 0, opacity: hasImage ? 1 : 0.4 }}
-        />
 
-        <Box
-          sx={{
-            opacity: hasImage && showBackground ? 1 : 0.4,
-            pointerEvents: hasImage && showBackground ? "auto" : "none",
-          }}
-        >
-          <Stack direction="row" sx={{ justifyContent: "space-between" }}>
-            <Typography variant="caption">Image opacity</Typography>
-            <Typography variant="caption" color="text.secondary">
-              {Math.round(backgroundOpacity * 100)}%
-            </Typography>
-          </Stack>
-          <WheelSlider
-            size="small"
-            value={backgroundOpacity}
-            min={0.05}
-            max={1}
-            step={0.05}
-            disabled={!hasImage || !showBackground}
-            onChange={(_, v) => onBackgroundOpacityChange(v as number)}
-          />
-        </Box>
+            {showBackground && (
+              <>
+                <Box>
+                  <Stack direction="row" sx={{ justifyContent: "space-between" }}>
+                    <Typography variant="caption">Image opacity</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      {Math.round(backgroundOpacity * 100)}%
+                    </Typography>
+                  </Stack>
+                  <WheelSlider
+                    size="small"
+                    value={backgroundOpacity}
+                    min={0.05}
+                    max={1}
+                    step={0.05}
+                    onChange={(_, v) => onBackgroundOpacityChange(v as number)}
+                  />
+                </Box>
 
-        <FormControlLabel
-          disabled={!hasImage}
-          control={
-            <Switch
-              size="small"
-              checked={showTraceCurves}
-              onChange={(_, v) => onShowTraceCurvesChange(v)}
-            />
-          }
-          label={<Typography variant="caption">Detect curves</Typography>}
-          sx={{ ml: 0, mr: 0, opacity: hasImage ? 1 : 0.4 }}
-        />
+                <FormControlLabel
+                  control={
+                    <Switch
+                      size="small"
+                      checked={showTraceCurves}
+                      onChange={(_, v) => onShowTraceCurvesChange(v)}
+                    />
+                  }
+                  label={<Typography variant="caption">Detect curves</Typography>}
+                  sx={{ ml: 0, mr: 0 }}
+                />
 
-        <FormControlLabel
-          disabled={!hasImage || !showTraceCurves}
-          control={
-            <Switch
-              size="small"
-              checked={traceMode === "lines"}
-              onChange={(_, v) => onTraceModeChange(v ? "lines" : "outlines")}
-            />
-          }
-          label={
-            <Typography variant="caption">
-              Centerlines (stroke middle)
-            </Typography>
-          }
-          sx={{
-            ml: 0,
-            mr: 0,
-            opacity: hasImage && showTraceCurves ? 1 : 0.4,
-          }}
-        />
+                {showTraceCurves && (
+                  <>
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          size="small"
+                          checked={traceMode === "lines"}
+                          onChange={(_, v) =>
+                            onTraceModeChange(v ? "lines" : "outlines")
+                          }
+                        />
+                      }
+                      label={
+                        <Typography variant="caption">
+                          Centerlines (stroke middle)
+                        </Typography>
+                      }
+                      sx={{ ml: 0, mr: 0 }}
+                    />
 
-        <Box
-          sx={{
-            opacity: hasImage && showTraceCurves ? 1 : 0.4,
-            pointerEvents: hasImage && showTraceCurves ? "auto" : "none",
-          }}
-        >
-          <Stack direction="row" sx={{ justifyContent: "space-between" }}>
-            <Typography variant="caption">Threshold</Typography>
-            <Typography variant="caption" color="text.secondary">
-              {threshold}
-            </Typography>
-          </Stack>
-          <WheelSlider
-            size="small"
-            value={threshold}
-            min={0}
-            max={255}
-            step={1}
-            disabled={!hasImage || !showTraceCurves}
-            onChange={(_, v) => onThresholdChange(v as number)}
-          />
-        </Box>
+                    <Box>
+                      <Stack
+                        direction="row"
+                        sx={{ justifyContent: "space-between" }}
+                      >
+                        <Typography variant="caption">Threshold</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {threshold}
+                        </Typography>
+                      </Stack>
+                      <WheelSlider
+                        size="small"
+                        value={threshold}
+                        min={0}
+                        max={255}
+                        step={1}
+                        onChange={(_, v) => onThresholdChange(v as number)}
+                      />
+                    </Box>
 
-        <Box
-          sx={{
-            opacity: hasImage && showTraceCurves ? 1 : 0.4,
-            pointerEvents: hasImage && showTraceCurves ? "auto" : "none",
-          }}
-        >
-          <Stack direction="row" sx={{ justifyContent: "space-between" }}>
-            <Typography variant="caption">Simplify</Typography>
-            <Typography variant="caption" color="text.secondary">
-              {smooth.toFixed(2)}
-            </Typography>
-          </Stack>
-          <WheelSlider
-            size="small"
-            value={smooth}
-            min={0}
-            max={1}
-            step={0.05}
-            disabled={!hasImage || !showTraceCurves}
-            onChange={(_, v) => onSmoothChange(v as number)}
-          />
-        </Box>
+                    <Box>
+                      <Stack
+                        direction="row"
+                        sx={{ justifyContent: "space-between" }}
+                      >
+                        <Typography variant="caption">Simplify</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {smooth.toFixed(2)}
+                        </Typography>
+                      </Stack>
+                      <WheelSlider
+                        size="small"
+                        value={smooth}
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        onChange={(_, v) => onSmoothChange(v as number)}
+                      />
+                    </Box>
 
-        <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.3 }}>
-          {!hasImage
-            ? "Load an image to detect curves"
-            : !showTraceCurves
-              ? "Curve detection off — image only"
-              : curveCount > 0
-                ? `${curveCount} ${
-                    traceMode === "lines" ? "line" : "curve"
-                  }${curveCount === 1 ? "" : "s"} — hover & click to import`
-                : traceMode === "lines"
-                  ? "No centerlines found — try adjusting threshold"
-                  : "No curves found — try adjusting threshold"}
-        </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ lineHeight: 1.3 }}
+                    >
+                      {curveCount > 0
+                        ? `${curveCount} ${
+                            traceMode === "lines" ? "line" : "curve"
+                          }${curveCount === 1 ? "" : "s"} — hover & click to import`
+                        : traceMode === "lines"
+                          ? "No centerlines found — try adjusting threshold"
+                          : "No curves found — try adjusting threshold"}
+                    </Typography>
+                  </>
+                )}
+              </>
+            )}
+          </>
+        )}
       </Stack>
     </Box>
   );

@@ -1,6 +1,10 @@
-import { Box, IconButton, Typography } from "@mui/material";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Box, IconButton } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import type { CutterParams, StampParams } from "../types";
+
+/** Keep size across hide/show remounts. */
+let lastWallProfileSize: { w: number; h: number } | null = null;
 
 type Props = {
   params: CutterParams;
@@ -187,8 +191,9 @@ function LargeProfile({
     <svg
       viewBox={`0 0 ${svgW} ${svgH}`}
       width="100%"
-      preserveAspectRatio="xMinYMin meet"
-      style={{ pointerEvents: "none", display: "block", height: "auto" }}
+      height="100%"
+      preserveAspectRatio="xMidYMid meet"
+      style={{ pointerEvents: "none", display: "block" }}
     >
       {showStamp && (
         <>
@@ -501,10 +506,88 @@ function LargeProfile({
 }
 
 export function CrossSection({ params, stamp, onHide }: Props) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [size, setSize] = useState<{ w: number; h: number } | null>(
+    lastWallProfileSize,
+  );
+  const sizeRef = useRef(size);
+  sizeRef.current = size;
+
+  const panelEl = () => {
+    const wrap = rootRef.current?.parentElement;
+    return wrap?.parentElement ?? wrap ?? null;
+  };
+
+  useLayoutEffect(() => {
+    if (size || !rootRef.current) return;
+    const panel = panelEl();
+    if (!panel) return;
+    const maxW = Math.max(200, panel.clientWidth - 60);
+    const maxH = Math.max(140, panel.clientHeight - 16);
+    const w = Math.min(maxW, Math.max(280, Math.round(maxW * 0.92)));
+    const aspect = stamp ? 0.42 : 0.38;
+    const h = Math.min(maxH, Math.max(160, Math.round(w * aspect)));
+    const next = { w, h };
+    lastWallProfileSize = next;
+    setSize(next);
+  }, [size, stamp]);
+
+  const handleRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handle = handleRef.current;
+    if (!handle) return;
+    const onDown = (ev: PointerEvent) => {
+      const cur = sizeRef.current;
+      if (!cur || ev.button !== 0) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const startX = ev.clientX;
+      const startY = ev.clientY;
+      const startW = cur.w;
+      const startH = cur.h;
+      const onMove = (moveEv: PointerEvent) => {
+        const panel = panelEl();
+        const maxW = panel
+          ? Math.max(200, panel.clientWidth - 60)
+          : Number.POSITIVE_INFINITY;
+        const maxH = panel
+          ? Math.max(140, panel.clientHeight - 16)
+          : Number.POSITIVE_INFINITY;
+        // Lower-left handle: drag left/down grows the box. Upper-right stays put.
+        const w = Math.min(
+          maxW,
+          Math.max(180, Math.round(startW + (startX - moveEv.clientX))),
+        );
+        const h = Math.min(
+          maxH,
+          Math.max(120, Math.round(startH + (moveEv.clientY - startY))),
+        );
+        const next = { w, h };
+        lastWallProfileSize = next;
+        setSize(next);
+      };
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onUp);
+    };
+    handle.addEventListener("pointerdown", onDown);
+    return () => handle.removeEventListener("pointerdown", onDown);
+  }, []);
+
   return (
     <Box
+      ref={rootRef}
       sx={{
-        width: "100%",
+        position: "relative",
+        width: size ? size.w : "100%",
+        height: size ? size.h : 200,
+        maxWidth: "100%",
         maxHeight: "100%",
         overflow: "hidden",
         bgcolor: "rgba(255,255,255,0.94)",
@@ -513,32 +596,57 @@ export function CrossSection({ params, stamp, onHide }: Props) {
         borderRadius: 1,
         boxShadow: 2,
         px: 0.5,
-        pt: 0.25,
-        pb: 0.25,
+        pt: 0.5,
+        pb: 0.5,
+        boxSizing: "border-box",
       }}
     >
-      <Box
+      <IconButton
+        size="small"
+        aria-label="Hide wall profile"
+        onClick={onHide}
         sx={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          pointerEvents: "auto",
-          gap: 0.5,
+          position: "absolute",
+          top: 2,
+          right: 2,
+          zIndex: 2,
+          p: 0.25,
+          bgcolor: "rgba(255,255,255,0.72)",
+          "&:hover": { bgcolor: "rgba(255,255,255,0.92)" },
         }}
       >
-        <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10 }}>
-          Wall profile
-        </Typography>
-        <IconButton
-          size="small"
-          aria-label="Hide wall profile"
-          onClick={onHide}
-          sx={{ p: 0.25 }}
-        >
-          <CloseIcon sx={{ fontSize: 14 }} />
-        </IconButton>
+        <CloseIcon sx={{ fontSize: 14 }} />
+      </IconButton>
+      <Box sx={{ width: "100%", height: "100%" }}>
+        <LargeProfile params={params} stamp={stamp} />
       </Box>
-      <LargeProfile params={params} stamp={stamp} />
+      <Box
+        ref={handleRef}
+        role="separator"
+        aria-label="Resize wall profile"
+        sx={{
+          position: "absolute",
+          left: 0,
+          bottom: 0,
+          width: 18,
+          height: 18,
+          cursor: "sw-resize",
+          zIndex: 2,
+          touchAction: "none",
+          "&::after": {
+            content: '""',
+            position: "absolute",
+            left: 3,
+            bottom: 3,
+            width: 9,
+            height: 9,
+            borderLeft: "2px solid",
+            borderBottom: "2px solid",
+            borderColor: "rgba(0,0,0,0.35)",
+            borderBottomLeftRadius: 2,
+          },
+        }}
+      />
     </Box>
   );
 }

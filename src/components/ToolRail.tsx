@@ -71,10 +71,15 @@ function RailSep() {
   return (
     <Divider
       flexItem
-      sx={{ width: 52, alignSelf: "center", borderColor: "divider", my: 0.25 }}
+      sx={{ width: 36, alignSelf: "center", borderColor: "divider", my: 0.15 }}
     />
   );
 }
+
+const railBtnSx = {
+  p: 0.6,
+  "& .MuiSvgIcon-root": { fontSize: 20 },
+} as const;
 
 export function ToolRail({
   mode,
@@ -102,22 +107,29 @@ export function ToolRail({
   return (
     <Box
       sx={{
-        width: 72,
+        width: 56,
         flexShrink: 0,
+        height: "100%",
+        minHeight: 0,
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
-        gap: 1,
-        py: 1.5,
+        gap: 0.35,
+        py: 0.75,
         bgcolor: "background.paper",
         borderRight: 1,
         borderColor: "divider",
+        overflowY: "auto",
+        overflowX: "hidden",
+        scrollbarWidth: "thin",
       }}
     >
       <Tooltip title="Edit — move / scale / rotate (V)" placement="right">
         <IconButton
+          size="small"
           color={mode === "edit" ? "primary" : "default"}
           onClick={() => onModeChange("edit")}
+          sx={railBtnSx}
         >
           <SelectArrowIcon />
         </IconButton>
@@ -128,8 +140,10 @@ export function ToolRail({
         placement="right"
       >
         <IconButton
+          size="small"
           color={mode === "curveEdit" ? "primary" : "default"}
           onClick={() => onModeChange("curveEdit")}
+          sx={railBtnSx}
         >
           <EditCurveIcon />
         </IconButton>
@@ -139,8 +153,10 @@ export function ToolRail({
 
       <Tooltip title="Draw freehand (B)" placement="right">
         <IconButton
+          size="small"
           color={mode === "draw" ? "primary" : "default"}
           onClick={() => onModeChange("draw")}
+          sx={railBtnSx}
         >
           <GestureIcon />
         </IconButton>
@@ -151,8 +167,10 @@ export function ToolRail({
         placement="right"
       >
         <IconButton
+          size="small"
           color={mode === "polygon" ? "primary" : "default"}
           onClick={() => onModeChange("polygon")}
+          sx={railBtnSx}
         >
           <PentagonOutlinedIcon />
         </IconButton>
@@ -163,8 +181,10 @@ export function ToolRail({
         placement="right"
       >
         <IconButton
+          size="small"
           color={mode === "ellipse" ? "primary" : "default"}
           onClick={() => onModeChange("ellipse")}
+          sx={railBtnSx}
         >
           <CircleOutlinedIcon />
         </IconButton>
@@ -174,8 +194,10 @@ export function ToolRail({
 
       <Tooltip title="Background image / trace curves (I)" placement="right">
         <IconButton
+          size="small"
           color={imagePanelOpen ? "primary" : "default"}
           onClick={onOpenImagePanel}
+          sx={railBtnSx}
         >
           <ImageIcon />
         </IconButton>
@@ -186,8 +208,10 @@ export function ToolRail({
         placement="right"
       >
         <IconButton
+          size="small"
           color={snapGrid ? "primary" : "default"}
           onClick={() => onSnapGridChange(!snapGrid)}
+          sx={railBtnSx}
         >
           <GridOnIcon />
         </IconButton>
@@ -195,8 +219,10 @@ export function ToolRail({
 
       <Tooltip title="Measure / set size from a length (M)" placement="right">
         <IconButton
+          size="small"
           color={mode === "measure" ? "primary" : "default"}
           onClick={() => onModeChange("measure")}
+          sx={railBtnSx}
         >
           <StraightenIcon />
         </IconButton>
@@ -207,8 +233,10 @@ export function ToolRail({
         placement="right"
       >
         <IconButton
+          size="small"
           color={snapCurves ? "primary" : "default"}
           onClick={() => onSnapCurvesChange(!snapCurves)}
+          sx={railBtnSx}
         >
           <MagnetIcon sx={{ transform: "rotate(45deg)" }} />
         </IconButton>
@@ -219,23 +247,13 @@ export function ToolRail({
         placement="right"
       >
         <span>
-          <IconButton disabled={!canDelete} onClick={onDeleteCurrent}>
+          <IconButton
+            size="small"
+            disabled={!canDelete}
+            onClick={onDeleteCurrent}
+            sx={railBtnSx}
+          >
             <DeleteOutlineIcon />
-          </IconButton>
-        </span>
-      </Tooltip>
-
-      <Tooltip
-        title={
-          canClearCanvas
-            ? "Clear canvas — curves, stamps & background"
-            : "Canvas is empty"
-        }
-        placement="right"
-      >
-        <span>
-          <IconButton disabled={!canClearCanvas} onClick={onClearCanvas}>
-            <Broom size={24} strokeWidth={1.75} />
           </IconButton>
         </span>
       </Tooltip>
@@ -247,7 +265,12 @@ export function ToolRail({
         placement="right"
       >
         <span>
-          <IconButton disabled={!canUndo} onClick={onUndo}>
+          <IconButton
+            size="small"
+            disabled={!canUndo}
+            onClick={onUndo}
+            sx={railBtnSx}
+          >
             <UndoIcon />
           </IconButton>
         </span>
@@ -258,7 +281,12 @@ export function ToolRail({
         placement="right"
       >
         <span>
-          <IconButton disabled={!canRedo} onClick={onRedo}>
+          <IconButton
+            size="small"
+            disabled={!canRedo}
+            onClick={onRedo}
+            sx={railBtnSx}
+          >
             <RedoIcon />
           </IconButton>
         </span>
@@ -273,8 +301,35 @@ export function ToolRail({
         placement="right"
       >
         <span>
-          <IconButton disabled={!canSaveDraft} onClick={onSaveDraft}>
+          <IconButton
+            size="small"
+            disabled={!canSaveDraft}
+            onClick={onSaveDraft}
+            sx={railBtnSx}
+          >
             <SaveOutlinedIcon />
+          </IconButton>
+        </span>
+      </Tooltip>
+
+      <RailSep />
+
+      <Tooltip
+        title={
+          canClearCanvas
+            ? "Clear canvas — curves, stamps & background"
+            : "Canvas is empty"
+        }
+        placement="right"
+      >
+        <span>
+          <IconButton
+            size="small"
+            disabled={!canClearCanvas}
+            onClick={onClearCanvas}
+            sx={railBtnSx}
+          >
+            <Broom size={20} strokeWidth={1.75} />
           </IconButton>
         </span>
       </Tooltip>
@@ -282,26 +337,25 @@ export function ToolRail({
       {showSmooth && (
         <Box
           sx={{
-            mt: 2,
-            flex: 1,
+            mt: 1,
+            mb: 0.5,
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
-            minHeight: 160,
-            overflow: "visible",
+            flexShrink: 0,
           }}
         >
           <Typography
             variant="caption"
             color="text.secondary"
-            sx={{ fontSize: 10, lineHeight: 1.2 }}
+            sx={{ fontSize: 9, lineHeight: 1.2 }}
           >
             Smooth
           </Typography>
           <Typography
             variant="caption"
             color="text.secondary"
-            sx={{ mb: 0.75, fontSize: 11, fontVariantNumeric: "tabular-nums" }}
+            sx={{ mb: 0.5, fontSize: 10, fontVariantNumeric: "tabular-nums" }}
           >
             {simplifyTolerance.toFixed(1)}
           </Typography>
@@ -319,9 +373,9 @@ export function ToolRail({
             // Value shown above the track — hover chip would cover the canvas
             valueLabelDisplay="off"
             sx={{
-              height: 120,
-              py: 1,
-              "& .MuiSlider-thumb": { width: 14, height: 14 },
+              height: 96,
+              py: 0.5,
+              "& .MuiSlider-thumb": { width: 12, height: 12 },
             }}
           />
         </Box>

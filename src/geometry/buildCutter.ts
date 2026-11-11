@@ -9,9 +9,8 @@ import {
   signedArea,
   toMm,
 } from "./offset";
+import { meshFidelity } from "./pathEdit";
 import { simplifyClosedCapped } from "./pathLimits";
-
-const MAX_MID_PTS = 160;
 
 function shapeFrom(pts: Vec2[]): THREE.Shape {
   const s = new THREE.Shape();
@@ -356,7 +355,11 @@ export function buildCutter(
   const scaled = toMm(pathPx, params.sizeMm);
   // Keep sketch corners. Only drop points that sit on a straight edge
   // (uniform resampling used to miss corners once sides were unequal).
-  const mid = ensureCcw(simplifyClosedCapped(scaled.points, 0.05, MAX_MID_PTS));
+  // Quality 2 matches the old 0.05 mm / 160 point cutter; higher keeps the curve.
+  const fidelity = meshFidelity(params.meshQuality);
+  const mid = ensureCcw(
+    simplifyClosedCapped(scaled.points, fidelity.epsMm, fidelity.maxPts),
+  );
   const half = params.wallThicknessMm / 2;
   const rim = Math.max(0, params.rimWidthMm);
   const baseH = Math.max(0, params.baseHeightMm);
@@ -414,6 +417,7 @@ export function buildCutter(
         params.knifeHeightMm,
         params.bevelLayerMm,
         params.knifeTipMm,
+        fidelity.arcMm,
       );
     } else {
       addStackedKnife(

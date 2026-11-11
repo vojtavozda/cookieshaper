@@ -18,7 +18,7 @@ type Props = {
   open: boolean;
   onClose: () => void;
   /** Called with the example PDF, same as a drop/paste. */
-  onPick: (file: File) => void;
+  onPick: (file: File, ex: SketchExample) => void;
 };
 
 async function fetchExampleFile(ex: SketchExample): Promise<File> {
@@ -34,7 +34,7 @@ export function ExamplesDialog({ open, onClose, onPick }: Props) {
   const pick = async (ex: SketchExample) => {
     try {
       const file = await fetchExampleFile(ex);
-      onPick(file);
+      onPick(file, ex);
       onClose();
     } catch {
       window.alert(`Could not load example “${ex.title}”`);
@@ -61,7 +61,7 @@ export function ExamplesDialog({ open, onClose, onPick }: Props) {
         }}
       >
         <Typography component="span" variant="h6" sx={{ fontSize: 18 }}>
-          Load example
+          Load existing cookie shaper
         </Typography>
         <IconButton size="small" aria-label="Close" onClick={onClose}>
           <CloseIcon fontSize="small" />

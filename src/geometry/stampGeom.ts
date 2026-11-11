@@ -164,18 +164,24 @@ export function featureFootprints(
   const clip = [toPath(outline)];
   let shapes: PathsD;
   if (filled && closed && pts.length >= 3) {
-    // Solid pad — inflate slightly so the edge reads like the canvas stroke
-    const pad = inflatePathsD(
-      [toPath(pts)],
-      halfWidth,
-      JoinType.Round,
-      EndType.Polygon,
-      2,
-      2,
-      ROUND_ARC_TOL,
-    );
-    shapes = pad.length ? pad : [toPath(pts)];
+    if (halfWidth <= 1e-9) {
+      // Hairline width: filled region with no border inflation
+      shapes = [toPath(pts)];
+    } else {
+      // Solid pad — inflate slightly so the edge reads like the canvas stroke
+      const pad = inflatePathsD(
+        [toPath(pts)],
+        halfWidth,
+        JoinType.Round,
+        EndType.Polygon,
+        2,
+        2,
+        ROUND_ARC_TOL,
+      );
+      shapes = pad.length ? pad : [toPath(pts)];
+    }
   } else {
+    if (halfWidth <= 1e-9) return [];
     shapes = strokePolygons(pts, closed, halfWidth);
   }
   if (!shapes.length) return [];

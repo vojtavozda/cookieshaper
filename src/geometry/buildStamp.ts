@@ -55,7 +55,7 @@ function extrude(
   height: number,
   z0: number,
   color: number,
-  opts?: { raised?: boolean },
+  opts?: { raised?: boolean; part?: string },
 ): THREE.Mesh | null {
   if (outerIn.length < 3 || height <= 1e-4) return null;
   const outer = ensureCcw(outerIn);
@@ -80,7 +80,7 @@ function extrude(
   });
   geo.translate(0, 0, z0);
   const mesh = new THREE.Mesh(geo, stampMat(color, opts));
-  mesh.userData.part = "stamp";
+  mesh.userData.part = opts?.part ?? "stamp";
   return mesh;
 }
 
@@ -150,12 +150,54 @@ function footprintsToPaths(loops: Vec2[][]): PathsD {
   return loops.filter((l) => l.length >= 3).map(toPath);
 }
 
+/** Remove hole areas from raised and recessed footprints. */
+function cutHoles(subjects: PathsD, holes: PathsD): PathsD {
+  if (!subjects.length || !holes.length) return subjects;
+  return differenceD(subjects, holes, FillRule.NonZero, 2).filter(
+    (p) => p.length >= 3 && Math.abs(areaD(p)) > 1e-4,
+  );
+}
+
+/** Raised pads, recessed pockets, with holes subtracted from both. */
+function stampReliefPaths(
+  args: BuildStampArgs,
+  frame: ReturnType<typeof mmFrame>,
+  stampOutline: Vec2[] | null,
+): { raised: PathsD; recessed: PathsD } {
+  const raisedPaths: PathsD = [];
+  const recessedPaths: PathsD = [];
+  const holePaths: PathsD = [];
+  if (!stampOutline || stampOutline.length < 3) {
+    return { raised: raisedPaths, recessed: recessedPaths };
+  }
+  if (args.outlineEnabled !== false) {
+    const rimW = Math.max(0.05, args.outlineWidthMm ?? 0.6);
+    const rim = rimAnnulus(stampOutline, rimW);
+    raisedPaths.push(...footprintsToPaths(rim));
+  }
+  for (const f of args.features) {
+    if (f.points.length < 2) continue;
+    const mmPts = f.points.map((p) => mapMm(p, frame));
+    const half = f.widthMm <= 1e-9 ? 0 : Math.max(0.05, f.widthMm / 2);
+    const loops = featureFootprints(mmPts, f.closed, f.filled, half, stampOutline);
+    const paths = footprintsToPaths(loops);
+    if (f.hole) holePaths.push(...paths);
+    else if (f.raised) raisedPaths.push(...paths);
+    else recessedPaths.push(...paths);
+  }
+  return {
+    raised: cutHoles(raisedPaths, holePaths),
+    recessed: cutHoles(recessedPaths, holePaths),
+  };
+}
+
 /** Dark outline on the plate top so recess / raise boundaries stay visible. */
 function addFeatureEdges(
   group: THREE.Group,
   loops: Vec2[][],
   z: number,
   color: number,
+  part = "stamp",
 ) {
   const mat = new THREE.LineBasicMaterial({
     color,
@@ -173,7 +215,7 @@ function addFeatureEdges(
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
     const line = new THREE.Line(geo, mat);
-    line.userData.part = "stamp";
+    line.userData.part = part;
     group.add(line);
   }
 }
@@ -210,24 +252,11 @@ export function buildStamp(args: BuildStampArgs): THREE.Group {
       : offsetClosedClipper(cutterMm, -inset);
   if (!outline || outline.length < 3) return group;
 
-  const raisedPaths: PathsD = [];
-  const recessedPaths: PathsD = [];
-
-  if (args.outlineEnabled !== false) {
-    const rimW = Math.max(0.05, args.outlineWidthMm ?? 0.6);
-    const rim = rimAnnulus(outline, rimW);
-    raisedPaths.push(...footprintsToPaths(rim));
-  }
-
-  for (const f of args.features) {
-    if (f.points.length < 2) continue;
-    const mmPts = f.points.map((p) => mapMm(p, frame));
-    const half = Math.max(0.05, f.widthMm / 2);
-    const loops = featureFootprints(mmPts, f.closed, f.filled, half, outline);
-    const paths = footprintsToPaths(loops);
-    if (f.raised) raisedPaths.push(...paths);
-    else recessedPaths.push(...paths);
-  }
+  const { raised: raisedPaths, recessed: recessedPaths } = stampReliefPaths(
+    args,
+    frame,
+    outline,
+  );
 
   const wantRecess = recessedPaths.length > 0 && args.recessMm > 1e-4;
   const throughHole = wantRecess && args.recessMm >= plate - 1e-6;
@@ -293,6 +322,78 @@ export function buildStamp(args: BuildStampArgs): THREE.Group {
     for (const ring of groupRings(raisedPaths)) {
       const mesh = extrude(ring.outer, ring.holes, raiseH, plate, RAISE_COLOR, {
         raised: true,
+      });
+      if (mesh) group.add(mesh);
+    }
+  }
+  return group;
+}
+
+function mirrorLoop(pts: Vec2[]): Vec2[] {
+  const m = pts.map((p) => ({ x: -p.x, y: p.y }));
+  m.reverse();
+  return m;
+}
+
+function mirrorPaths(paths: PathsD): PathsD {
+  return paths.map((path) => mirrorLoop(fromPath(path)).map((p) => ({ x: p.x, y: p.y })));
+}
+
+const COOKIE_COLOR = 0xd4924a;
+/** Pocket floor (raised stamp) — slightly darker dough, not a new material. */
+const COOKIE_POCKET = 0xc4843e;
+/** Bump (recessed stamp) — slightly lighter dough; keep close to the main body. */
+const COOKIE_BUMP = 0xdea05c;
+
+/**
+ * Dough cut by the cutter, with the stamp pressed in:
+ * left-right mirror, raised stamp → pocket, recessed stamp → bump.
+ */
+export function buildCookie(args: BuildStampArgs): THREE.Group {
+  const group = new THREE.Group();
+  group.userData.part = "cookie";
+  const frame = mmFrame(args.cutterPx, args.sizeMm);
+  const cutterMm = args.cutterPx.map((p) => mapMm(p, frame));
+  const inset = Math.max(0.05, args.wallMm / 2 + Math.max(0, args.gapMm));
+  const stampOutline =
+    args.outlinePx && args.outlinePx.length >= 3
+      ? args.outlinePx.map((p) => mapMm(p, frame))
+      : offsetClosedClipper(cutterMm, -inset);
+  const cookieRaw =
+    offsetClosedClipper(cutterMm, -Math.max(0.05, args.wallMm / 2)) ?? cutterMm;
+  if (cookieRaw.length < 3) return group;
+  const cookie = mirrorLoop(cookieRaw);
+
+  const relief = stampReliefPaths(args, frame, stampOutline);
+  // Stamp relief, flipped: what stuck out of the stamp is a dent in the dough.
+  const pockets = mirrorPaths(relief.raised);
+  const bumps = mirrorPaths(relief.recessed);
+  const dough = Math.max(6, args.plateMm, args.raiseMm + 1.5);
+  const pocket = Math.min(Math.max(0, args.raiseMm), Math.max(0.4, dough - 0.8));
+  const bumpH = Math.max(0, args.recessMm);
+  const part = "cookie";
+
+  const baseH = dough - pocket;
+  if (pocket > 1e-4 && pockets.length && baseH > 1e-4) {
+    const base = extrude(cookie, [], baseH, 0, COOKIE_POCKET, { part });
+    if (base) group.add(base);
+    const topPaths = differenceD([toPath(cookie)], pockets, FillRule.NonZero, 2);
+    for (const ring of groupRings(topPaths)) {
+      const mesh = extrude(ring.outer, ring.holes, pocket, baseH, COOKIE_COLOR, {
+        part,
+      });
+      if (mesh) group.add(mesh);
+    }
+  } else {
+    const slab = extrude(cookie, [], dough, 0, COOKIE_COLOR, { part });
+    if (slab) group.add(slab);
+  }
+
+  if (bumpH > 1e-4 && bumps.length) {
+    for (const ring of groupRings(bumps)) {
+      // No stamp-style emissive — bumps should read as the same dough.
+      const mesh = extrude(ring.outer, ring.holes, bumpH, dough, COOKIE_BUMP, {
+        part,
       });
       if (mesh) group.add(mesh);
     }

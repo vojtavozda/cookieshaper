@@ -10,6 +10,11 @@ import paper from "paper";
 import {
   Box,
   Button,
+  Checkbox,
+  CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
   Divider,
   FormControlLabel,
   IconButton,
@@ -21,10 +26,17 @@ import {
 } from "@mui/material";
 import SaveAltIcon from "@mui/icons-material/SaveAlt";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutlined";
-import { PawPrint, Stamp } from "lucide-react";
+import { Library, Microwave, PawPrint, SquareCheckBig, Stamp } from "lucide-react";
 import type { Vec2 } from "../types";
 import type { CanvasMode } from "./ToolRail";
 import { ExamplesDialog } from "./ExamplesDialog";
+import type { SketchExample } from "../examplesCatalog";
+import {
+  DEFAULT_PROJECT_NAME,
+  projectDisplayName,
+  projectExportNames,
+  projectNameFromFilename,
+} from "../projectName";
 import { ImageTracePanel } from "./ImageTracePanel";
 import { WheelSlider } from "./WheelSlider";
 import {
@@ -33,6 +45,7 @@ import {
   detectSmoothFlags,
   makeSegmentCorner,
   makeSegmentSmooth,
+  meshSampleOpts,
   reverseRaw,
   samplePathPoints,
   simplifyTail,
@@ -54,6 +67,7 @@ import {
   isVectorFile,
   mmPerPxFromSvg,
   pathsFromPdfFile,
+  STAMP_HOLE_RGB,
   STAMP_PLATE_RGB,
   STAMP_RAISE_RGB,
   STAMP_RECESS_RGB,
@@ -67,17 +81,26 @@ import {
   jpegFromImageUrl,
   type SketchPdfBackground,
 } from "../geometry/exportSketchPdf";
-import { ensureCcw } from "../geometry/offset";
+import { cleanClosedPolyline, ensureCcw } from "../geometry/offset";
 import { offsetClosedClipper, stampRimLoopsPx } from "../geometry/stampGeom";
-import { JoinType } from "clipper2-ts";
 import {
   clearSketchDraft,
-  loadSketchDraft,
+  deleteTabDraft,
+  ensureSketchTabs,
+  loadTabDraft,
+  newSketchTabId,
   saveSketchDraft,
+  saveSketchTabIndex,
+  saveTabDraft,
   type SketchDraftItem,
+  type SketchTab,
 } from "../geometry/sketchDraft";
 import type { StampFeatureIn, StampParams } from "../types";
 import { DEFAULT_STAMP } from "../types";
+import {
+  loadCloseTabConfirmHidden,
+  saveCloseTabConfirmHidden,
+} from "../storage";
 
 const SNAP_SCREEN = 16;
 const NODE_SCREEN = 5;
@@ -104,6 +127,8 @@ type PathMeta = {
   /** Feature → owning cutter id. */
   ownerId?: string;
   raised?: boolean;
+  /** Cuts raised and recessed marks in this area. */
+  hole?: boolean;
   widthMm?: number;
   filled?: boolean;
   /** Special raised rim along the stamp plate edge (not in metasRef). */
@@ -137,6 +162,28 @@ type DragEdit =
       origin: paper.Point;
       started: boolean;
     }
+  | {
+      kind: "nodes";
+      meta: PathMeta;
+      indices: number[];
+      grabbed: number;
+      origin: paper.Point;
+      starts: paper.Point[];
+      started: boolean;
+    }
+  | {
+      kind: "marquee";
+      meta: PathMeta;
+      origin: paper.Point;
+      rect: paper.Path | null;
+    }
+  | {
+      kind: "select-rect";
+      origin: paper.Point;
+      rect: paper.Path | null;
+      shift: boolean;
+      ctrl: boolean;
+    }
   | { kind: "handle-in"; meta: PathMeta; index: number }
   | { kind: "handle-out"; meta: PathMeta; index: number }
       | {
@@ -155,6 +202,8 @@ type DragEdit =
       last: paper.Point;
       started: boolean;
       linked: PathMeta[];
+      /** Preserve edit-mode multi-selection after the drag. */
+      keepMulti?: PathMeta[];
     }
   | {
       kind: "xform-scale";
@@ -207,6 +256,7 @@ type Snapshot = {
     stampId?: string;
     ownerId?: string;
     raised?: boolean;
+    hole?: boolean;
     widthMm?: number;
     filled?: boolean;
     stampPlate?: boolean;
@@ -240,6 +290,8 @@ type Props = {
   ) => void;
   /** Short status after Ctrl+S draft flush. */
   onDraftSaved?: (message: string) => void;
+  /** 1–5 sampling density of smooth curves in the 3D mesh. */
+  meshQuality: number;
   /** Paper units → mm (always defined; from measure calibration or Size). */
   mmPerPx: number;
   onMmPerPxChange: (mmPerPx: number) => void;
@@ -271,6 +323,26 @@ type Props = {
   saveSketchToken?: number;
   /** Live API for sketch export (PDF / ZIP). */
   saveApiRef?: MutableRefObject<CanvasSaveApi | null>;
+  /** Fired after the canvas PDF icon actually saves a file (not cancelled). */
+  onSketchPdfSaved?: () => void;
+  /** Cookie / project title used in download filenames. */
+  projectName: string;
+  onProjectNameChange: (name: string) => void;
+  /** Keep the app-level tab strip in sync. */
+  onSketchTabsChange?: (tabs: SketchTab[], activeId: string | null) => void;
+};
+
+/** One open tab, ready to drop into the “everything” ZIP. */
+export type ZipSketchPart = {
+  name: string;
+  pdf: Uint8Array | null;
+  /** Closed cutter outline. Null when this tab cannot build a solid. */
+  pts: Vec2[] | null;
+  /** Null when the cutter has no stamp. Empty array is a blank stamp plate. */
+  features: StampFeatureIn[] | null;
+  stamp: StampParams;
+  outlinePx: Vec2[] | null;
+  mmPerPx: number | null;
 };
 
 export type CanvasSaveApi = {
@@ -278,6 +350,15 @@ export type CanvasSaveApi = {
   buildPdfBytes: () => Promise<Uint8Array | null>;
   /** Flush IndexedDB sketch draft (Ctrl+S / floppy). */
   saveDraft: () => Promise<void>;
+  /**
+   * Non-empty open tabs: live geometry for the active tab, stored drafts
+   * for the rest. Does not switch the visible canvas.
+   */
+  collectZipSketches: () => Promise<ZipSketchPart[]>;
+  switchSketchTab: (id: string) => Promise<void>;
+  requestCloseTab: (id: string) => Promise<void>;
+  openFreshTab: () => Promise<void>;
+  openLibrary: () => void;
 };
 
 type MeasureEdit = {
@@ -295,11 +376,14 @@ type ScopeExtras = {
   __setMode?: () => void;
   __setSnapGrid?: () => void;
   __syncStamp?: () => void;
+  /** Re-sample curves into the 3D polyline after mesh quality changes. */
+  __resampleMesh?: () => void;
   __toggleStamp?: () => void;
   /** Remove stamp (features + rim) from a cutter, or the stamp currently being edited. */
   __removeStamp?: (meta?: PathMeta) => void;
   __setFeatureWidth?: (widthMm: number) => void;
   __setFeatureRaised?: (raised: boolean) => void;
+  __setFeatureHole?: () => void;
   __toggleFeatureFill?: () => void;
   __mirrorObject?: (axis: "h" | "v") => void;
   /** Clipper2 outset/inset by a fixed mm amount (closed curves only). */
@@ -320,12 +404,23 @@ type ScopeExtras = {
   __setBgOpacity?: (opacity: number) => void;
   __rebuildImageContours?: (threshold: number, smooth: number) => number;
   __clearImageContours?: () => void;
-  __importVectorFile?: (file: File) => Promise<void>;
+  __importVectorFile?: (
+    file: File,
+    opts?: { preferredName?: string },
+  ) => Promise<void>;
+  /** Copy the selected curve (edit / curve edit). */
+  __copyCurve?: () => boolean;
   __saveSketchPdf?: () => void | Promise<"saved" | "cancelled" | void>;
   /** Build sketch PDF bytes without downloading (for ZIP). */
   __buildSketchPdfBytes?: () => Promise<Uint8Array | null>;
+  __collectZipSketches?: () => Promise<ZipSketchPart[]>;
   __scheduleDraftSave?: () => void;
   __flushDraftSave?: (toast?: boolean) => void;
+  /** New blank tab when the current sketch is not empty. */
+  __openFreshTab?: () => Promise<void>;
+  __switchSketchTab?: (id: string) => Promise<void>;
+  __requestCloseTab?: (id: string) => Promise<void>;
+  __confirmCloseTab?: (id: string) => Promise<void>;
 };
 
 function isTypingTarget(t: EventTarget | null) {
@@ -377,6 +472,7 @@ export function DrawCanvas({
   onStampChange,
   onStampFeatures,
   onDraftSaved,
+  meshQuality,
   mmPerPx,
   onMmPerPxChange,
   onClosedPathChange,
@@ -397,7 +493,31 @@ export function DrawCanvas({
   onHasCurvesChange,
   saveSketchToken = 0,
   saveApiRef,
+  onSketchPdfSaved,
+  projectName,
+  onProjectNameChange,
+  onSketchTabsChange,
 }: Props) {
+  const onSketchPdfSavedRef = useRef(onSketchPdfSaved);
+  onSketchPdfSavedRef.current = onSketchPdfSaved;
+  const onSketchTabsChangeRef = useRef(onSketchTabsChange);
+  onSketchTabsChangeRef.current = onSketchTabsChange;
+  const projectNameRef = useRef(projectName);
+  projectNameRef.current = projectName;
+  const onProjectNameChangeRef = useRef(onProjectNameChange);
+  onProjectNameChangeRef.current = onProjectNameChange;
+  const [nameEditing, setNameEditing] = useState(false);
+  const [pdfSaving, setPdfSaving] = useState(false);
+  const [sketchTabs, setSketchTabs] = useState<SketchTab[]>([]);
+  const [activeSketchId, setActiveSketchId] = useState<string | null>(null);
+  const [closeSketch, setCloseSketch] = useState<SketchTab | null>(null);
+  const [closePdfSaved, setClosePdfSaved] = useState(false);
+  const [closeDontAsk, setCloseDontAsk] = useState(false);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+  const activeSketchIdRef = useRef<string | null>(null);
+  const sketchTabsRef = useRef<SketchTab[]>([]);
+  /** Skip one project-name → tab-label write when the name came from a tab load. */
+  const skipNameSyncRef = useRef(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const scopeRef = useRef<paper.PaperScope | null>(null);
@@ -406,9 +526,16 @@ export function DrawCanvas({
   const gizmosRef = useRef<EditGizmo[]>([]);
   /** Object-edit transform overlays (box, corners, orange points). */
   const xformItemsRef = useRef<paper.Item[]>([]);
+  /** Orange hairline + points while continuing a curve in draw/polygon. */
+  const continueChromeRef = useRef<paper.Item[]>([]);
   const selectedRef = useRef<PathMeta | null>(null);
+  /** Edit-mode multi-selection. Last entry is the primary (gizmo) curve. */
+  const selectedManyRef = useRef<PathMeta[]>([]);
   const drawingRef = useRef<paper.Path | null>(null);
   const [canvasEmpty, setCanvasEmpty] = useState(true);
+  /** File drag hovering the canvas (image / PDF / SVG import). */
+  const [fileDragOver, setFileDragOver] = useState(false);
+  const fileDragDepthRef = useRef(0);
   const [examplesOpen, setExamplesOpen] = useState(false);
   /** Finished curves on the canvas (enables Save). */
   const [hasCurves, setHasCurves] = useState(false);
@@ -454,6 +581,8 @@ export function DrawCanvas({
   const selectedPointRef = useRef<{ meta: PathMeta; index: number } | null>(
     null,
   );
+  /** Curve-edit: every point inside the marquee, or the clicked point. */
+  const selectedPointsRef = useRef<number[]>([]);
   const bgRef = useRef<paper.Raster | null>(null);
   const polygonRef = useRef<paper.Path | null>(null);
   const polyPreviewRef = useRef<paper.Path | null>(null);
@@ -492,22 +621,22 @@ export function DrawCanvas({
   const onDraftSavedRef = useRef(onDraftSaved);
   onDraftSavedRef.current = onDraftSaved;
   const [stampUi, setStampUi] = useState<"off" | "add" | "edit" | "back">("off");
-  const [canAddCutterAround, setCanAddCutterAround] = useState(false);
   const [featureHud, setFeatureHud] = useState<{
     rim?: boolean;
     widthMm: number;
     raised: boolean;
+    hole: boolean;
     filled: boolean;
     closed: boolean;
   } | null>(null);
   const setStampUiRef = useRef(setStampUi);
   setStampUiRef.current = setStampUi;
-  const setCanAddCutterAroundRef = useRef(setCanAddCutterAround);
-  setCanAddCutterAroundRef.current = setCanAddCutterAround;
   const setFeatureHudRef = useRef(setFeatureHud);
   setFeatureHudRef.current = setFeatureHud;
   const mmPerPxRef = useRef(mmPerPx);
   mmPerPxRef.current = mmPerPx;
+  const meshQualityRef = useRef(meshQuality);
+  meshQualityRef.current = meshQuality;
   const showBackgroundRef = useRef(showBackground);
   showBackgroundRef.current = showBackground;
   const showTraceCurvesRef = useRef(showTraceCurves);
@@ -539,6 +668,7 @@ export function DrawCanvas({
     items: SketchDraftItem[];
     stampOwnerId: string | null;
     mmPerPx: number | null;
+    quiet?: boolean;
   } | null>(null);
   const finishPendingDraftRestoreRef = useRef<(() => void) | null>(null);
   const finishPendingPdfImportRef = useRef<
@@ -617,7 +747,8 @@ export function DrawCanvas({
 
     const rebuildImageContours = (threshold: number, smoothAmt: number) => {
       clearImageContours();
-      if (!showTraceCurvesRef.current) return 0;
+      // Previews live with the image — hide both when "Show image" is off.
+      if (!showBackgroundRef.current || !showTraceCurvesRef.current) return 0;
       const img = imageDataRef.current;
       const sz = imageSizeRef.current;
       const raster = bgRef.current;
@@ -779,20 +910,62 @@ export function DrawCanvas({
     };
 
     const featureColor = (m: PathMeta) =>
-      m.raised === false ? "#1e3a8a" : "#7f1d1d";
+      m.hole ? "#263238" : m.raised === false ? "#1e3a8a" : "#7f1d1d";
+
+    /** Holes sit above the marks they cancel, and under the plate / cutter. */
+    const orderFeatureStack = () => {
+      const owner = stampOwnerRef.current;
+      const mask = stampMaskRef.current;
+      const features = metasRef.current.filter(
+        (m) =>
+          m.role === "feature" &&
+          m.path.visible &&
+          (!owner || m.ownerId === owner.id),
+      );
+      const solids = features.filter((m) => !m.hole);
+      const holes = features.filter((m) => m.hole);
+      if (owner && mask) {
+        for (const m of solids) m.path.insertBelow(mask);
+        for (const h of holes) h.path.insertBelow(mask);
+        return;
+      }
+      for (const m of solids) m.path.sendToBack();
+      for (const h of holes) h.path.bringToFront();
+      for (const m of metasRef.current) {
+        if (m.role !== "feature" && m.path.visible && !m.stampRim) {
+          m.path.bringToFront();
+        }
+      }
+    };
 
     const styleFeature = (m: PathMeta, gray = false) => {
-      const color = gray ? "#9aa3ab" : featureColor(m);
-      const w = Math.max(0.2, m.widthMm ?? lastWidthMm.current);
+      const raw = m.widthMm ?? lastWidthMm.current;
+      const w = Number.isFinite(raw) ? Math.max(0, raw) : 0.6;
       m.widthMm = w;
+      m.path.strokeCap = "round";
+      m.path.strokeJoin = "round";
+      m.path.dashArray = [];
+      m.path.data = { ...(m.path.data || {}), kind: "feature" };
+      // Holes use the same fill / width rules as raised & recessed, in charcoal.
+      const color = gray ? "#9aa3ab" : featureColor(m);
+      m.path.fillColor = m.filled ? new scope.Color(color) : null;
+      m.path.opacity = gray ? 0.4 : m.filled ? 0.9 : 1;
+      if (w <= 1e-9) {
+        // Hairline: filled pads have no border; strokes stay a 1px screen line.
+        if (m.filled) {
+          m.path.strokeColor = null;
+          m.path.strokeWidth = 0;
+        } else {
+          m.path.strokeColor = new scope.Color(color);
+          m.path.strokeWidth = Math.max(1, screen(1));
+        }
+        orderFeatureStack();
+        return;
+      }
       const px = mmPerPxRef.current > 1e-6 ? w / mmPerPxRef.current : 1.5;
       m.path.strokeColor = new scope.Color(color);
       m.path.strokeWidth = Math.max(1, px);
-      m.path.strokeCap = "round";
-      m.path.strokeJoin = "round";
-      m.path.fillColor = m.filled ? new scope.Color(color) : null;
-      m.path.opacity = gray ? 0.4 : m.filled ? 0.9 : 1;
-      m.path.data = { ...(m.path.data || {}), kind: "feature" };
+      orderFeatureStack();
     };
 
     const styleStampPlate = (m: PathMeta) => {
@@ -998,26 +1171,49 @@ export function DrawCanvas({
       curveHoverRef.current = highlight;
     };
 
+    const metaIsPickable = (m: PathMeta, owner: PathMeta | null) => {
+      if (!m.path.visible || m.path.locked) return false;
+      if (owner) {
+        const plate = m.stampPlate && m.ownerId === owner.id;
+        const feat = m.role === "feature" && m.ownerId === owner.id;
+        if (!plate && !feat) return false;
+      } else if (m.role === "feature") {
+        return false;
+      }
+      return true;
+    };
+
     /** Closest editable curve near the pointer (nested curves win over large parents). */
     const pickEditableMeta = (pt: paper.Point): PathMeta | null => {
       const lim = screen(8);
       let best: PathMeta | null = null;
       let bestD = lim;
       const owner = stampOwnerRef.current;
+      let fillBest: PathMeta | null = null;
+      let fillArea = Infinity;
       for (const m of metasRef.current) {
-        if (!m.path.visible || m.path.locked) continue;
-        if (owner) {
-          const plate = m.stampPlate && m.ownerId === owner.id;
-          const feat = m.role === "feature" && m.ownerId === owner.id;
-          if (!plate && !feat) continue;
-        } else if (m.role === "feature") {
-          continue;
-        }
+        if (!metaIsPickable(m, owner)) continue;
         const loc = m.path.getNearestLocation(pt);
-        if (!loc || loc.distance >= bestD) continue;
-        bestD = loc.distance;
-        best = m;
+        if (loc && loc.distance < bestD) {
+          bestD = loc.distance;
+          best = m;
+        }
+        // Filled pads: a click in the interior selects the shape.
+        // The smallest containing fill wins when several overlap.
+        if (
+          m.filled &&
+          m.path.closed &&
+          m.path.contains(pt)
+        ) {
+          const area = Math.abs(m.path.area);
+          if (area < fillArea) {
+            fillArea = area;
+            fillBest = m;
+          }
+        }
       }
+      if (best) return best;
+      if (fillBest) return fillBest;
       // Raised outline rim — filled annulus, clickable / not point-editable.
       // Stamp-first plates are the rim's outer edge, so the annulus must not steal the click.
       if (
@@ -1467,6 +1663,7 @@ export function DrawCanvas({
       ensureSmoothFlags(meta);
       meta.raw = cloneRaw(meta.path);
       clearAddPointMark();
+      setSelectedPoints([]);
       setSelection(meta, true);
     };
 
@@ -1511,6 +1708,14 @@ export function DrawCanvas({
       preview.bringToFront();
     };
 
+    /** Curve-edit centerline drawn over the real stroke. */
+    let curveHairline: paper.Path | null = null;
+
+    const clearCurveHairline = () => {
+      curveHairline?.remove();
+      curveHairline = null;
+    };
+
     const clearGizmos = () => {
       for (const g of gizmosRef.current) {
         g.node.remove();
@@ -1520,6 +1725,7 @@ export function DrawCanvas({
         g.lineOut?.remove();
       }
       gizmosRef.current = [];
+      clearCurveHairline();
     };
 
     const clearXformGizmos = () => {
@@ -1559,6 +1765,41 @@ export function DrawCanvas({
         Math.max(b.width + pad * 2, screen(12)),
         Math.max(b.height + pad * 2, screen(12)),
       );
+    };
+
+    /** Union of padded bounds for a multi-selection. */
+    const selectionGroupBounds = (list: PathMeta[]) => {
+      let u: paper.Rectangle | null = null;
+      for (const m of list) {
+        const b = selectionPadBounds(m);
+        u = u ? u.unite(b) : b.clone();
+      }
+      return u;
+    };
+
+    /** Everything that must translate with a multi-move (curves + linked stamp parts). */
+    const gatherMultiMovers = (list: PathMeta[]): PathMeta[] => {
+      const seen = new Set<PathMeta>();
+      const out: PathMeta[] = [];
+      for (const item of list) {
+        if (
+          !item ||
+          seen.has(item) ||
+          item.stampRim ||
+          item.derivedFromId ||
+          !metasRef.current.includes(item)
+        ) {
+          continue;
+        }
+        out.push(item);
+        seen.add(item);
+        for (const linked of linkedWithCutter(item)) {
+          if (seen.has(linked)) continue;
+          out.push(linked);
+          seen.add(linked);
+        }
+      }
+      return out;
     };
 
     const cornerOf = (b: paper.Rectangle, i: number) => {
@@ -1632,14 +1873,112 @@ export function DrawCanvas({
       return "nesw-resize";
     };
 
+    const clearContinueChrome = () => {
+      for (const it of continueChromeRef.current) it.remove();
+      continueChromeRef.current = [];
+    };
+
+    /** Orange centerline + vertex dots (selection / continue-from-endpoint). */
+    const pushOrangePathChrome = (
+      meta: PathMeta,
+      into: paper.Item[],
+      opts?: { hairline?: boolean; maxDotIndex?: number },
+    ) => {
+      if (meta.stampRim) return;
+      const wantHair =
+        opts?.hairline !== false &&
+        (meta.role === "feature" || meta.stampPlate || opts?.hairline === true);
+      if (wantHair) {
+        const hair = meta.path.clone() as paper.Path;
+        hair.strokeColor = new scope.Color("#c45c26");
+        hair.strokeWidth = Math.max(1, screen(1));
+        hair.fillColor = null;
+        hair.dashArray = [];
+        hair.opacity = 1;
+        hair.selected = false;
+        hair.locked = true;
+        hair.bringToFront();
+        into.push(hair);
+      }
+      const pr = screen(2.6);
+      const last =
+        opts?.maxDotIndex != null
+          ? Math.min(opts.maxDotIndex, meta.path.segments.length - 1)
+          : meta.path.segments.length - 1;
+      for (let i = 0; i <= last; i++) {
+        const seg = meta.path.segments[i];
+        if (!seg) continue;
+        const dot = new scope.Path.Circle({
+          center: seg.point,
+          radius: pr,
+          fillColor: new scope.Color("#c45c26"),
+          strokeColor: null,
+        });
+        dot.locked = true;
+        into.push(dot);
+      }
+    };
+
+    /**
+     * While extending an open curve in draw/polygon, show the same orange
+     * hairline + points as object-edit selection.
+     */
+    const rebuildContinueChrome = () => {
+      clearContinueChrome();
+      if (modeRef.current !== "draw" && modeRef.current !== "polygon") return;
+      let meta: PathMeta | null = null;
+      let maxDotIndex: number | undefined;
+      let forceHair = false;
+      if (continueMetaRef.current && drawingRef.current) {
+        meta = continueMetaRef.current;
+        // Freehand adds dense samples — keep dots on the already-finished part.
+        maxDotIndex = continueAnchorRef.current;
+        forceHair = true;
+      } else if (polygonRef.current && polyBaseCount > 0) {
+        meta =
+          metasRef.current.find((m) => m.path === polygonRef.current) ?? null;
+        forceHair = true;
+      }
+      if (!meta) return;
+      pushOrangePathChrome(meta, continueChromeRef.current, {
+        hairline: forceHair || meta.role === "feature" || !!meta.stampPlate,
+        maxDotIndex,
+      });
+    };
+
     const rebuildTransformGizmos = () => {
       clearXformGizmos();
+      const many = activeSelection();
+      const strokeW = screen(1.1);
+      if (many.length > 1) {
+        for (const m of many) {
+          const hi = m.path.clone() as paper.Path;
+          hi.strokeColor = new scope.Color("#1e88e5");
+          hi.strokeWidth = Math.max(m.path.strokeWidth || 1.5, screen(2));
+          hi.fillColor = null;
+          hi.selected = false;
+          hi.locked = true;
+          hi.bringToFront();
+          xformItemsRef.current.push(hi);
+        }
+        const gb = selectionGroupBounds(many);
+        if (gb) {
+          const box = new scope.Path.Rectangle(gb);
+          box.strokeColor = new scope.Color("#1e88e5");
+          box.strokeWidth = strokeW;
+          box.dashArray = [screen(5), screen(3)];
+          box.fillColor = null;
+          box.locked = true;
+          box.bringToFront();
+          xformItemsRef.current.push(box);
+        }
+        return;
+      }
       const meta = selectedRef.current;
       if (!meta) return;
       meta.path.fullySelected = false;
       meta.path.selected = false;
       const b = selectionPadBounds(meta);
-      const strokeW = screen(1.1);
       const box = new scope.Path.Rectangle(b);
       box.strokeColor = new scope.Color("#1e88e5");
       box.strokeWidth = strokeW;
@@ -1665,18 +2004,28 @@ export function DrawCanvas({
         xformItemsRef.current.push(sq);
       }
 
-      // Small orange anchors (visual only)
-      const pr = screen(2.6);
-      for (const seg of meta.path.segments) {
-        const dot = new scope.Path.Circle({
-          center: seg.point,
-          radius: pr,
-          fillColor: new scope.Color("#c45c26"),
-          strokeColor: null,
-        });
-        dot.locked = true;
-        xformItemsRef.current.push(dot);
-      }
+      // Stamp marks: orange hairline over the real red/blue/black stroke + width.
+      // Cutters already stroke orange — dots only.
+      pushOrangePathChrome(meta, xformItemsRef.current, {
+        hairline: meta.role === "feature" || !!meta.stampPlate,
+      });
+    };
+
+    const restorePathDisplay = (m: PathMeta) => {
+      if (m.stampRim || !metasRef.current.includes(m)) return;
+      if (m.role === "feature") styleFeature(m);
+      else if (m.stampPlate) styleStampPlate(m);
+      else
+        cutterStroke(
+          m,
+          !!stampOwnerRef.current && stampOwnerRef.current !== m,
+        );
+    };
+
+    const clearCurveEditStroke = () => {
+      clearCurveHairline();
+      const meta = selectedRef.current;
+      if (meta) restorePathDisplay(meta);
     };
 
     const rebuildCurveEditGizmos = () => {
@@ -1686,6 +2035,19 @@ export function DrawCanvas({
       ensureSmoothFlags(meta);
       meta.path.fullySelected = false;
       meta.path.selected = false;
+      restorePathDisplay(meta);
+      // Teal centerline over the real stroke. Distinct from selection blue,
+      // handle grey, open-end red, and the cutter orange.
+      const hair = meta.path.clone() as paper.Path;
+      hair.strokeColor = new scope.Color("#00897b");
+      hair.strokeWidth = Math.max(1, screen(1));
+      hair.fillColor = null;
+      hair.dashArray = [];
+      hair.opacity = 1;
+      hair.selected = false;
+      hair.locked = true;
+      hair.bringToFront();
+      curveHairline = hair;
       const nodeR = screen(NODE_SCREEN);
       const handleR = screen(HANDLE_SCREEN);
       const strokeW = screen(1.2);
@@ -1749,24 +2111,44 @@ export function DrawCanvas({
       for (const g of gizmosRef.current) g.node.bringToFront();
     };
 
+    const setSelectedPoints = (indices: number[]) => {
+      const meta = selectedRef.current;
+      selectedPointsRef.current = indices;
+      selectedPointRef.current =
+        meta && indices.length
+          ? { meta, index: indices[indices.length - 1] }
+          : null;
+    };
+
+    const paintPointSelection = () => {
+      const meta = selectedRef.current;
+      if (!meta) return;
+      const picked = new Set(selectedPointsRef.current);
+      const hover = hoverNodeRef.current;
+      for (const g of gizmosRef.current) {
+        if (hover && hover.meta === g.meta && hover.index === g.index) continue;
+        if (g.meta === meta && picked.has(g.index)) {
+          (g.node as paper.Path).fillColor = new scope.Color("#1e88e5");
+        }
+      }
+    };
+
     const rebuildEditGizmos = () => {
       clearGizmos();
       clearXformGizmos();
       clearCurveHover();
       hoverNodeRef.current = null;
       const mode = modeRef.current;
-      if (mode === "edit") rebuildTransformGizmos();
-      else if (mode === "curveEdit") {
+      if (mode === "edit") {
+        clearCurveEditStroke();
+        rebuildTransformGizmos();
+      } else if (mode === "curveEdit") {
         rebuildCurveEditGizmos();
-        const ptSel = selectedPointRef.current;
-        if (ptSel) {
-          const g = gizmosRef.current.find(
-            (x) => x.meta === ptSel.meta && x.index === ptSel.index,
-          );
-          if (g) (g.node as paper.Path).fillColor = new scope.Color("#1e88e5");
-        }
+        paintPointSelection();
         const segSel = selectedSegmentRef.current;
         if (segSel) showCurveHover(segSel.meta, segSel.segIndex);
+      } else {
+        clearCurveEditStroke();
       }
     };
 
@@ -1776,13 +2158,17 @@ export function DrawCanvas({
       drawStartMarkerRef.current?.remove();
       drawStartMarkerRef.current = null;
       clearMagnet();
+      clearContinueChrome();
     };
 
     const refreshDrawMarkers = () => {
       for (const e of endsRef.current) e.marker.remove();
       endsRef.current = [];
       // Show open endpoints in freehand and polygon so new strokes can continue / join
-      if (modeRef.current !== "draw" && modeRef.current !== "polygon") return;
+      if (modeRef.current !== "draw" && modeRef.current !== "polygon") {
+        clearContinueChrome();
+        return;
+      }
       const activePoly = polygonRef.current;
       const activeDraw = drawingRef.current;
       const continuing = !!continueMetaRef.current;
@@ -1804,6 +2190,7 @@ export function DrawCanvas({
           endsRef.current.push({ meta, which, marker: makeEndMarker(pt) });
         }
       }
+      rebuildContinueChrome();
     };
 
     /** Prefer an open-curve endpoint under the cursor (for continue / join). */
@@ -1860,6 +2247,7 @@ export function DrawCanvas({
         stampId: m.stampId,
         ownerId: m.ownerId,
         raised: m.raised,
+        hole: m.hole,
         widthMm: m.widthMm,
         filled: m.filled,
         stampPlate: m.stampPlate,
@@ -1896,6 +2284,7 @@ export function DrawCanvas({
         stampId: m.stampId,
         ownerId: m.ownerId,
         raised: m.raised,
+        hole: m.hole,
         widthMm: m.widthMm,
         filled: m.filled,
         stampPlate: m.stampPlate,
@@ -1932,20 +2321,27 @@ export function DrawCanvas({
       }
       draftSavePending = false;
       const items = collectDraftItems().filter((it) => it.raw.length >= 2);
-      if (!items.length) {
-        await clearSketchDraft();
-        return;
-      }
       const bg = await captureBackgroundBlob();
+      const record = {
+        items,
+        mmPerPx: mmPerPxRef.current > 0 ? mmPerPxRef.current : null,
+        stamp: stampRef.current ?? { ...DEFAULT_STAMP },
+        stampOwnerId: stampOwnerRef.current?.id ?? null,
+        bgPlace: bg.place,
+        background: bg.blob,
+      };
+      const tabId = activeSketchIdRef.current;
       try {
-        await saveSketchDraft({
-          items,
-          mmPerPx: mmPerPxRef.current > 0 ? mmPerPxRef.current : null,
-          stamp: stampRef.current ?? { ...DEFAULT_STAMP },
-          stampOwnerId: stampOwnerRef.current?.id ?? null,
-          bgPlace: bg.place,
-          background: bg.blob,
-        });
+        if (!items.length && !bg.blob) {
+          if (tabId) await deleteTabDraft(tabId);
+          await clearSketchDraft();
+        } else if (tabId) {
+          await saveTabDraft(tabId, record);
+          // Mirror the open tab so a refresh still finds a draft if the index lags.
+          await saveSketchDraft(record);
+        } else {
+          await saveSketchDraft(record);
+        }
         if (opts?.toast) {
           onDraftSavedRef.current?.("Sketch saved in this browser");
         }
@@ -1993,6 +2389,7 @@ export function DrawCanvas({
           stampId: item.stampId,
           ownerId: item.ownerId,
           raised: item.raised,
+          hole: item.hole,
           widthMm: item.widthMm,
           filled: item.filled,
           stampPlate: item.stampPlate,
@@ -2089,14 +2486,12 @@ export function DrawCanvas({
         }
         ensureId(plate);
         const pts = samplePlatePts(plate.path);
-        const loop = offsetClosedClipper(
-          pts,
-          cutterOutsetPx(),
-          0.05,
-          JoinType.Miter,
-          8,
-        );
-        if (!loop || loop.length < 3) continue;
+        // Round joins — miter (limit 8) threw rare spikes at sharp / near-collinear
+        // sample corners; the 3D wall already uses Round for the same reason.
+        const rawLoop = offsetClosedClipper(pts, cutterOutsetPx(), 0.05);
+        if (!rawLoop || rawLoop.length < 3) continue;
+        const loop = cleanClosedPolyline(rawLoop);
+        if (loop.length < 3) continue;
         let cutter = derivedFor(plate);
         if (!cutter) {
           const path = new scope.Path({
@@ -2143,17 +2538,13 @@ export function DrawCanvas({
     };
 
     let emitTimer: number | null = null;
-    const emitClosedNow = () => {
-      rebuildDerivedCutters();
+    /** Cutter polyline + stamp marks from whatever is currently in metasRef. */
+    const closedMeshSnapshot = (): {
+      pts: Vec2[] | null;
+      features: StampFeatureIn[] | null;
+      outlinePx: Vec2[] | null;
+    } => {
       const cutters = metasRef.current.filter((m) => isCutterShape(m));
-      setHasClosedCurve(
-        cutters.some((m) => m.path.closed) ||
-          metasRef.current.some((m) => m.stampPlate && m.path.closed),
-      );
-      setHasCurves(
-        cutters.some((m) => m.path.segments.length >= 2) ||
-          metasRef.current.some((m) => m.stampPlate && m.path.segments.length >= 2),
-      );
       const sel = selectedRef.current;
       // Prefer the stamp being edited so 3D keeps its plate while drawing features.
       // A stamp-plate Bézier is never the cutter mesh — its generated cutter is.
@@ -2171,39 +2562,47 @@ export function DrawCanvas({
         cutters.find((m) => m.path.closed && m.stampId) ??
         cutters.find((m) => m.path.closed) ??
         null;
-      if (!closed) {
-        onClosedRef.current(null);
-        onStampFeaturesRef.current(null, null);
-        return;
-      }
+      if (!closed) return { pts: null, features: null, outlinePx: null };
       ensureId(closed);
-      const pts = samplePathPoints(closed.path, {
-        flatness: 0.45,
-        minPerCurve: 16,
-        maxPoints: 400,
-      });
-      onClosedRef.current(pts.length >= 3 ? pts : null);
-      if (!closed.stampId) {
-        onStampFeaturesRef.current(null, null);
-        return;
-      }
+      const sampled = samplePathPoints(
+        closed.path,
+        meshSampleOpts(meshQualityRef.current, "outline"),
+      );
+      const pts = sampled.length >= 3 ? sampled : null;
+      if (!closed.stampId) return { pts, features: null, outlinePx: null };
       const plate = plateFor(closed);
       const outlinePx = plate ? samplePlatePts(plate.path) : null;
       const features: StampFeatureIn[] = metasRef.current
         .filter((m) => m.role === "feature" && m.ownerId === closed.id)
         .filter((m) => m.path.segments.length >= 2)
         .map((m) => ({
-          points: samplePathPoints(m.path, {
-            flatness: 0.45,
-            minPerCurve: 8,
-            maxPoints: 240,
-          }),
+          points: samplePathPoints(
+            m.path,
+            meshSampleOpts(meshQualityRef.current, "feature"),
+          ),
           closed: m.path.closed,
           filled: !!m.filled,
           raised: m.raised !== false,
+          hole: !!m.hole,
           widthMm: m.widthMm ?? 0.6,
         }));
-      onStampFeaturesRef.current(features, outlinePx);
+      return { pts, features, outlinePx };
+    };
+
+    const emitClosedNow = () => {
+      rebuildDerivedCutters();
+      const cutters = metasRef.current.filter((m) => isCutterShape(m));
+      setHasClosedCurve(
+        cutters.some((m) => m.path.closed) ||
+          metasRef.current.some((m) => m.stampPlate && m.path.closed),
+      );
+      setHasCurves(
+        cutters.some((m) => m.path.segments.length >= 2) ||
+          metasRef.current.some((m) => m.stampPlate && m.path.segments.length >= 2),
+      );
+      const snap = closedMeshSnapshot();
+      onClosedRef.current(snap.pts);
+      onStampFeaturesRef.current(snap.features, snap.outlinePx);
     };
 
     const clearStampRimPreviews = () => {
@@ -2482,17 +2881,6 @@ export function DrawCanvas({
 
     const refreshStampUi = () => {
       const sel = selectedRef.current;
-      setCanAddCutterAroundRef.current(
-        !stampOwnerRef.current &&
-          !!sel &&
-          sel.role !== "feature" &&
-          !sel.stampPlate &&
-          !sel.derivedFromId &&
-          !sel.stampId &&
-          !sel.stampRim &&
-          sel.path.closed &&
-          sel.path.segments.length >= 3,
-      );
       if (stampOwnerRef.current) {
         setStampUiRef.current("back");
         return;
@@ -2523,6 +2911,7 @@ export function DrawCanvas({
           rim: true,
           widthMm: outlineWidthMmRef.current,
           raised: true,
+          hole: false,
           filled: false,
           closed: true,
         });
@@ -2530,6 +2919,7 @@ export function DrawCanvas({
         setFeatureHudRef.current({
           widthMm: sel.widthMm ?? 0.6,
           raised: sel.raised !== false,
+          hole: !!sel.hole,
           filled: !!sel.filled,
           closed: sel.path.closed,
         });
@@ -2602,11 +2992,19 @@ export function DrawCanvas({
           if (m.role === "feature" && m.ownerId === owner.id) m.path.sendToBack();
         }
         mask?.sendToBack();
-        // Features under the mask so the part outside the outline reads grey.
-        for (const m of metasRef.current) {
-          if (m.role === "feature" && m.ownerId === owner.id) {
-            if (mask) m.path.insertBelow(mask);
-          }
+        // Solids first, then holes, so a hole paints over the mark it cancels.
+        // Both stay under the mask so the part outside the outline reads grey.
+        const owned = metasRef.current.filter(
+          (m) => m.role === "feature" && m.ownerId === owner.id,
+        );
+        for (const m of owned) {
+          if (m.hole) continue;
+          if (mask) m.path.insertBelow(mask);
+        }
+        for (const m of owned) {
+          if (!m.hole) continue;
+          if (mask) m.path.insertBelow(mask);
+          else m.path.bringToFront();
         }
         owner.path.bringToFront();
         outline?.bringToFront();
@@ -2632,11 +3030,14 @@ export function DrawCanvas({
         rebuildStampRimPreviews();
         // Gray features under their cutters
         for (const m of metasRef.current) {
-          if (m.role === "feature" && m.path.visible) m.path.sendToBack();
+          if (m.role === "feature" && m.path.visible && !m.hole) m.path.sendToBack();
+        }
+        for (const m of metasRef.current) {
+          if (m.role === "feature" && m.path.visible && m.hole) m.path.bringToFront();
         }
         for (const rim of stampRimPreviewRef.current) rim.sendToBack();
         for (const m of metasRef.current) {
-          if (m.stampPlate && m.path.visible) m.path.bringToFront();
+          if (m.role !== "feature" && m.path.visible) m.path.bringToFront();
         }
       }
       refreshStampUi();
@@ -2682,7 +3083,7 @@ export function DrawCanvas({
       }, 280);
     };
 
-    const setSelection = (meta: PathMeta | null, emitImmediate = true) => {
+    const applySelection = (meta: PathMeta | null, emitImmediate = true) => {
       for (const m of metasRef.current) {
         m.path.fullySelected = false;
         m.path.selected = false;
@@ -2699,11 +3100,15 @@ export function DrawCanvas({
       }
       if (selectedPointRef.current && selectedPointRef.current.meta !== meta) {
         selectedPointRef.current = null;
+        selectedPointsRef.current = [];
       }
       selectedRef.current = meta;
-      onHasSelRef.current(!!meta);
+      onHasSelRef.current(!!meta || selectedManyRef.current.length > 0);
       onSimplifySyncRef.current?.(
-        meta && !meta.noSimplify && !meta.stampRim
+        meta &&
+          selectedManyRef.current.length <= 1 &&
+          !meta.noSimplify &&
+          !meta.stampRim
           ? (meta.simplifyTol ?? 1)
           : null,
       );
@@ -2712,6 +3117,93 @@ export function DrawCanvas({
       emitClosed(emitImmediate);
       refreshStampUi();
       refreshFeatureHud();
+    };
+
+    /** Curves that count as the current edit-mode selection. */
+    const activeSelection = (): PathMeta[] => {
+      const primary = selectedRef.current;
+      if (!primary || primary.stampRim) return primary ? [primary] : [];
+      const many = selectedManyRef.current.filter(
+        (m) => metasRef.current.includes(m) && !m.stampRim && !m.derivedFromId,
+      );
+      if (many.length > 1 && many.includes(primary)) return many;
+      return [primary];
+    };
+
+    const setSelection = (meta: PathMeta | null, emitImmediate = true) => {
+      selectedManyRef.current = meta ? [meta] : [];
+      applySelection(meta, emitImmediate);
+    };
+
+    const setMultiSelection = (
+      list: PathMeta[],
+      primary: PathMeta | null,
+      emitImmediate = true,
+    ) => {
+      const uniq: PathMeta[] = [];
+      for (const m of list) {
+        if (m && metasRef.current.includes(m) && !uniq.includes(m)) uniq.push(m);
+      }
+      selectedManyRef.current = uniq;
+      const meta =
+        primary && uniq.includes(primary)
+          ? primary
+          : (uniq[uniq.length - 1] ?? null);
+      applySelection(meta, emitImmediate);
+    };
+
+    /** Curves a click or edit-mode marquee is allowed to select. */
+    const selectableCurves = (): PathMeta[] => {
+      const owner = stampOwnerRef.current;
+      const out: PathMeta[] = [];
+      for (const m of metasRef.current) {
+        if (!m.path.visible || m.path.locked || m.derivedFromId || m.stampRim)
+          continue;
+        if (m.path.segments.length < 2) continue;
+        if (owner) {
+          const plate = m.stampPlate && m.ownerId === owner.id;
+          const feat = m.role === "feature" && m.ownerId === owner.id;
+          if (!plate && !feat) continue;
+        } else if (m.role === "feature") continue;
+        out.push(m);
+      }
+      return out;
+    };
+
+    const boundsInside = (b: paper.Rectangle, box: paper.Rectangle) =>
+      b.left >= box.left - 1e-6 &&
+      b.right <= box.right + 1e-6 &&
+      b.top >= box.top - 1e-6 &&
+      b.bottom <= box.bottom + 1e-6;
+
+    /**
+     * Left→right (crossing = false): curve bounds fully inside.
+     * Right→left (crossing): curve touches the rectangle.
+     */
+    const curveInMarquee = (
+      meta: PathMeta,
+      box: paper.Rectangle,
+      crossing: boolean,
+    ) => {
+      const b = meta.path.bounds;
+      if (b.width < 1e-6 && b.height < 1e-6) return box.contains(b.center);
+      if (!crossing) return boundsInside(b, box);
+      if (boundsInside(b, box)) return true;
+      if (!b.intersects(box)) return false;
+      if (meta.path.segments.some((s) => box.contains(s.point))) return true;
+      const probe = new scope.Path.Rectangle(box);
+      const hit = meta.path.getIntersections(probe).length > 0;
+      const covered =
+        !hit &&
+        meta.path.closed &&
+        [
+          probe.bounds.topLeft,
+          probe.bounds.topRight,
+          probe.bounds.bottomLeft,
+          probe.bounds.bottomRight,
+        ].some((p) => meta.path.contains(p));
+      probe.remove();
+      return hit || covered;
     };
 
     const reapplySimplify = (meta: PathMeta) => {
@@ -2751,28 +3243,45 @@ export function DrawCanvas({
     };
 
     extras.__deleteCurrent = () => {
-      const meta = selectedRef.current;
-      if (!meta) return;
-      // Outline rim is toggled off — not deleted
-      if (meta.stampRim || meta.derivedFromId) return;
+      const many = activeSelection().filter(
+        (m) => !m.stampRim && !m.derivedFromId,
+      );
+      if (!many.length) return;
       // Never delete the locked cutter while editing its stamp
-      if (stampOwnerRef.current && meta.role !== "feature" && !meta.stampPlate) return;
+      if (
+        stampOwnerRef.current &&
+        many.every((m) => m.role !== "feature" && !m.stampPlate)
+      ) {
+        return;
+      }
+      const targets = many.filter(
+        (m) =>
+          !(
+            stampOwnerRef.current &&
+            m.role !== "feature" &&
+            !m.stampPlate
+          ),
+      );
+      if (!targets.length) return;
       pushUndo();
-      if (stampOwnerRef.current === meta) stampOwnerRef.current = null;
-      const drop = new Set<PathMeta>([meta]);
-      if (meta.stampPlate) {
-        const cutter = derivedFor(meta);
-        if (cutter) {
-          if (stampOwnerRef.current === cutter) stampOwnerRef.current = null;
-          drop.add(cutter);
-          for (const m of metasRef.current) {
-            if (m !== meta && m.ownerId === cutter.id) drop.add(m);
+      const drop = new Set<PathMeta>();
+      for (const meta of targets) {
+        if (stampOwnerRef.current === meta) stampOwnerRef.current = null;
+        drop.add(meta);
+        if (meta.stampPlate) {
+          const cutter = derivedFor(meta);
+          if (cutter) {
+            if (stampOwnerRef.current === cutter) stampOwnerRef.current = null;
+            drop.add(cutter);
+            for (const m of metasRef.current) {
+              if (m !== meta && m.ownerId === cutter.id) drop.add(m);
+            }
           }
         }
-      }
-      if (meta.role !== "feature" && meta.id && !meta.stampPlate) {
-        for (const m of metasRef.current) {
-          if (m.ownerId === meta.id) drop.add(m);
+        if (meta.role !== "feature" && meta.id && !meta.stampPlate) {
+          for (const m of metasRef.current) {
+            if (m.ownerId === meta.id) drop.add(m);
+          }
         }
       }
       for (const m of drop) m.path.remove();
@@ -2785,9 +3294,13 @@ export function DrawCanvas({
               m.ownerId === owner.id &&
               m.path.visible,
           ) ?? null)
-        : (metasRef.current.find((m) => m.role !== "feature" && m.path.visible) ??
-          metasRef.current.find((m) => m.path.visible) ??
-          null);
+        : targets.length === 1
+          ? (metasRef.current.find(
+              (m) => m.role !== "feature" && m.path.visible,
+            ) ??
+            metasRef.current.find((m) => m.path.visible) ??
+            null)
+          : null;
       selectedSegmentRef.current = null;
       selectedPointRef.current = null;
       clearCurveHover();
@@ -2797,17 +3310,8 @@ export function DrawCanvas({
       notifyMaybeEmpty();
     };
 
-    extras.__clearCanvas = () => {
-      const hadPaths = metasRef.current.length > 0;
-      const hadBg = !!bgRef.current || !!backgroundUrlRef.current;
-      const hadDraft =
-        hadPaths ||
-        !!drawingRef.current ||
-        !!polygonRef.current ||
-        !!ellipseDrag;
-      if (!hadPaths && !hadBg && !hadDraft) return;
-      if (hadPaths) pushUndo();
-
+    /** Drop the live sketch. Undo stacks are left for the caller. */
+    const wipeSketch = (opts?: { background?: boolean }) => {
       drawingRef.current?.remove();
       drawingRef.current = null;
       if (polygonRef.current && !metasRef.current.some((m) => m.path === polygonRef.current)) {
@@ -2824,13 +3328,12 @@ export function DrawCanvas({
       selectedSegmentRef.current = null;
       selectedPointRef.current = null;
       continueMetaRef.current = null;
-
       stampOwnerRef.current = null;
       clearStampChrome();
       for (const m of metasRef.current) m.path.remove();
       metasRef.current = [];
-
       selectedRef.current = null;
+      selectedManyRef.current = [];
       onHasSelRef.current(false);
       onSimplifySyncRef.current?.(null);
       clearGizmos();
@@ -2840,11 +3343,27 @@ export function DrawCanvas({
       refreshStampUi();
       syncEmpty();
       onClosedRef.current(null);
-      onStampFeaturesRef.current(null);
-      onCurvesEmptyRef.current();
-      onClearBackgroundRef.current();
+      onStampFeaturesRef.current(null, null);
+      if (opts?.background !== false) onClearBackgroundRef.current();
       setTraceOpen(false);
       onImagePanelOpenChangeRef.current(false);
+    };
+
+    extras.__clearCanvas = () => {
+      const hadPaths = metasRef.current.length > 0;
+      const hadBg = !!bgRef.current || !!backgroundUrlRef.current;
+      const hadDraft =
+        hadPaths ||
+        !!drawingRef.current ||
+        !!polygonRef.current ||
+        !!ellipseDrag;
+      if (!hadPaths && !hadBg && !hadDraft) return;
+      if (hadPaths) pushUndo();
+      wipeSketch();
+      onCurvesEmptyRef.current();
+      onProjectNameChangeRef.current(DEFAULT_PROJECT_NAME);
+      const tabId = activeSketchIdRef.current;
+      if (tabId) void deleteTabDraft(tabId);
       void clearSketchDraft();
       notifyHistory();
     };
@@ -2878,9 +3397,11 @@ export function DrawCanvas({
       }
       // Curve-edit → object edit (keep selection)
       if (modeRef.current === "curveEdit") {
+        if (dragRef.current?.kind === "marquee") dragRef.current.rect?.remove();
         dragRef.current = null;
         selectedSegmentRef.current = null;
         selectedPointRef.current = null;
+        selectedPointsRef.current = [];
         clearCurveHover();
         onModeChangeRef.current("edit");
         return;
@@ -3084,16 +3605,43 @@ export function DrawCanvas({
         selectedSegmentRef.current = null;
         // Open curve: keep deleting from the new tip on repeated Delete
         if (open && meta.path.segments.length >= 1 && (wasFirst || wasLast)) {
-          selectedPointRef.current = {
-            meta,
-            index: wasFirst ? 0 : meta.path.segments.length - 1,
-          };
+          setSelectedPoints([wasFirst ? 0 : meta.path.segments.length - 1]);
         } else {
-          selectedPointRef.current = null;
+          setSelectedPoints([]);
         }
         setSelection(meta, true);
       };
 
+      const multi = selectedPointsRef.current;
+      if (multi.length > 1 && selectedRef.current) {
+        const meta = selectedRef.current;
+        const n = meta.path.segments.length;
+        const minKeep = meta.path.closed ? 3 : 2;
+        const selected = [...new Set(multi)]
+          .filter((i) => i >= 0 && i < n)
+          .sort((a, b) => a - b);
+        const maxDrop = Math.max(0, n - minKeep);
+        if (!selected.length || maxDrop === 0) return;
+        const dropping =
+          selected.length <= maxDrop
+            ? selected
+            : selected.slice(selected.length - maxDrop);
+        const dropped = new Set(dropping);
+        pushUndo();
+        for (const index of [...dropping].sort((a, b) => b - a)) {
+          meta.path.removeSegment(index);
+          meta.smooth.splice(index, 1);
+        }
+        meta.raw = cloneRaw(meta.path);
+        hoverNodeRef.current = null;
+        selectedSegmentRef.current = null;
+        const kept = selected
+          .filter((i) => !dropped.has(i))
+          .map((i) => i - dropping.filter((d) => d < i).length);
+        setSelectedPoints(kept);
+        setSelection(meta, true);
+        return;
+      }
       const ptSel = selectedPointRef.current;
       if (ptSel) {
         deletePointAt(ptSel.meta, ptSel.index);
@@ -3687,6 +4235,27 @@ export function DrawCanvas({
         clearAddPointMark();
         clearSnapPreview();
         const meta = selectedRef.current;
+        const many = activeSelection();
+        if (many.length > 1) {
+          const gb = selectionGroupBounds(many);
+          const under = pickEditableMeta(e.point);
+          if (
+            (gb && gb.contains(e.point)) ||
+            (under && many.includes(under))
+          ) {
+            clearCurveHover();
+            canvas.style.cursor = "move";
+            return;
+          }
+          if (under) {
+            showPathHover(under);
+            canvas.style.cursor = "pointer";
+            return;
+          }
+          clearCurveHover();
+          canvas.style.cursor = "default";
+          return;
+        }
         if (meta) {
           const hit = hitXform(e.point, meta);
           if (hit) {
@@ -3748,28 +4317,13 @@ export function DrawCanvas({
             hoverNodeRef.current = null;
             paintHandleHover(gh.g, gh.kind === "handle-in" ? "in" : "out");
           }
-          // Keep selected point visible under hover paint
-          const ptSel = selectedPointRef.current;
-          if (ptSel) {
-            const g = gizmosRef.current.find(
-              (x) => x.meta === ptSel.meta && x.index === ptSel.index,
-            );
-            if (g && (!gh || gh.g !== g))
-              (g.node as paper.Path).fillColor = new scope.Color("#1e88e5");
-          }
+          paintPointSelection();
           canvas.style.cursor = "pointer";
           return;
         }
         hoverNodeRef.current = null;
         resetGizmoPaint();
-        // Paint selected point
-        const ptSel = selectedPointRef.current;
-        if (ptSel) {
-          const g = gizmosRef.current.find(
-            (x) => x.meta === ptSel.meta && x.index === ptSel.index,
-          );
-          if (g) (g.node as paper.Path).fillColor = new scope.Color("#1e88e5");
-        }
+        paintPointSelection();
         const meta = selectedRef.current;
         if (meta) {
           const ch = hitCurveSegment(meta, e.point);
@@ -3893,6 +4447,7 @@ export function DrawCanvas({
             clearPolyPreview();
             clearMagnet();
             setSelection(meta, false);
+            refreshDrawMarkers();
             syncEmpty();
             return;
           }
@@ -3928,6 +4483,7 @@ export function DrawCanvas({
         poly.add(pt);
         polyHandleDragRef.current = { index: poly.segments.length - 1 };
         clearPolyPreview();
+        if (polyBaseCount > 0) rebuildContinueChrome();
         return;
       }
 
@@ -3954,15 +4510,61 @@ export function DrawCanvas({
           return;
         }
 
-        // Prefer a nested / closer curve before transform handles of the selection
-        {
-          const nested = pickEditableMeta(e.point);
-          if (nested && nested !== meta) {
-            setSelection(nested, false);
-            return;
+        const shift = toolShift(e);
+        const ctrl = toolCtrlOrMeta(e);
+        const under = pickEditableMeta(e.point);
+        const many = activeSelection().filter((m) => !m.stampRim);
+        if ((shift || ctrl) && under && !under.stampRim && !under.derivedFromId) {
+          const cur = many;
+          if (ctrl) {
+            if (!cur.includes(under)) return;
+            const next = cur.filter((m) => m !== under);
+            setMultiSelection(
+              next,
+              meta && next.includes(meta) ? meta : (next[next.length - 1] ?? null),
+              false,
+            );
+          } else {
+            const next = cur.includes(under) ? cur : [...cur, under];
+            setMultiSelection(next, under, false);
           }
+          return;
         }
 
+        // Multi-selection: drag inside the group box (or on any selected curve) moves all
+        if (many.length > 1) {
+          const gb = selectionGroupBounds(many);
+          const onSelected = !!(under && many.includes(under));
+          if (onSelected || (gb && gb.contains(e.point))) {
+            const primary =
+              meta && many.includes(meta) ? meta : (many[many.length - 1] ?? null);
+            if (!primary) return;
+            const movers = gatherMultiMovers(many);
+            dragRef.current = {
+              kind: "xform-move",
+              meta: primary,
+              last: e.point.clone(),
+              started: false,
+              linked: movers.filter((m) => m !== primary),
+              keepMulti: many,
+            };
+            return;
+          }
+          if (under) {
+            setSelection(under, false);
+            return;
+          }
+          dragRef.current = {
+            kind: "select-rect",
+            origin: e.point.clone(),
+            rect: null,
+            shift,
+            ctrl,
+          };
+          return;
+        }
+
+        // Transform handles win over a shape underneath (hover already does this).
         if (meta) {
           const hit = hitXform(e.point, meta);
           if (hit) {
@@ -4010,22 +4612,28 @@ export function DrawCanvas({
           }
         }
 
+        // Prefer a nested / closer curve when not on a transform handle
+        if (under && under !== meta) {
+          setSelection(under, false);
+          return;
+        }
+
         // Click inside the selection box (but not on a handle) keeps selection
         if (meta && selectionPadBounds(meta).contains(e.point)) return;
 
-        const m = pickEditableMeta(e.point);
+        const m = under;
         if (m) {
           setSelection(m, false);
           return;
         }
-        // Empty click outside deselects
-        if (meta) {
-          selectedRef.current = null;
-          onHasSelRef.current(false);
-          onSimplifySyncRef.current?.(null);
-          rebuildEditGizmos();
-          emitClosed(true);
-        }
+        // Empty press — drag draws the curve marquee. A tiny drag deselects.
+        dragRef.current = {
+          kind: "select-rect",
+          origin: e.point.clone(),
+          rect: null,
+          shift,
+          ctrl,
+        };
         return;
       }
 
@@ -4044,15 +4652,25 @@ export function DrawCanvas({
         if (gh) {
           selectedSegmentRef.current = null;
           setSelection(gh.g.meta, false);
-          if (gh.kind === "node")
+          if (gh.kind === "node") {
+            const already = selectedPointsRef.current.includes(gh.g.index);
+            const indices = already
+              ? [...selectedPointsRef.current]
+              : [gh.g.index];
+            if (!already) setSelectedPoints(indices);
             dragRef.current = {
-              kind: "node",
+              kind: "nodes",
               meta: gh.g.meta,
-              index: gh.g.index,
+              indices,
+              grabbed: gh.g.index,
               origin: e.point.clone(),
+              starts: indices.map((i) =>
+                gh.g.meta.path.segments[i].point.clone(),
+              ),
               started: false,
             };
-          else if (gh.kind === "handle-in")
+            paintPointSelection();
+          } else if (gh.kind === "handle-in")
             dragRef.current = {
               kind: "handle-in",
               meta: gh.g.meta,
@@ -4069,7 +4687,7 @@ export function DrawCanvas({
         if (meta) {
           const ch = hitCurveSegment(meta, e.point);
           if (ch) {
-            selectedPointRef.current = null;
+            setSelectedPoints([]);
             dragRef.current = {
               kind: "curve",
               meta,
@@ -4081,10 +4699,22 @@ export function DrawCanvas({
             };
             return;
           }
+          const other = pickEditableMeta(e.point);
+          if (other && other !== meta) {
+            setSelectedPoints([]);
+            setSelection(other, false);
+            return;
+          }
+          // Empty press — drag draws the point marquee
+          selectedSegmentRef.current = null;
+          dragRef.current = {
+            kind: "marquee",
+            meta,
+            origin: e.point.clone(),
+            rect: null,
+          };
+          return;
         }
-        // Click empty → clear point/segment selection; maybe switch curve
-        selectedSegmentRef.current = null;
-        selectedPointRef.current = null;
         clearCurveHover();
         const m = pickEditableMeta(e.point);
         if (m) setSelection(m, false);
@@ -4185,6 +4815,7 @@ export function DrawCanvas({
           }
         }
         updatePolyPreview(e.point);
+        if (polyBaseCount > 0) rebuildContinueChrome();
         return;
       }
 
@@ -4203,6 +4834,7 @@ export function DrawCanvas({
           }
           updateDrawSnap(pt, drawingRef.current);
           showSnapPreview(e.point);
+          if (continueMetaRef.current) rebuildContinueChrome();
         }
         return;
       }
@@ -4267,6 +4899,85 @@ export function DrawCanvas({
         return;
       }
 
+      if (drag.kind === "select-rect") {
+        if (e.point.getDistance(drag.origin) < screen(3)) return;
+        drag.rect?.remove();
+        const box = new scope.Rectangle(
+          Math.min(drag.origin.x, e.point.x),
+          Math.min(drag.origin.y, e.point.y),
+          Math.abs(e.point.x - drag.origin.x),
+          Math.abs(e.point.y - drag.origin.y),
+        );
+        const crossing = e.point.x < drag.origin.x;
+        const rect = new scope.Path.Rectangle(box);
+        rect.strokeColor = new scope.Color(crossing ? "#2e7d32" : "#1e88e5");
+        rect.strokeWidth = screen(1);
+        rect.dashArray = crossing ? [screen(5), screen(4)] : [];
+        rect.fillColor = crossing
+          ? new scope.Color(0.18, 0.49, 0.2, 0.12)
+          : new scope.Color(0.12, 0.53, 0.9, 0.12);
+        rect.locked = true;
+        rect.bringToFront();
+        drag.rect = rect;
+        return;
+      }
+      if (drag.kind === "marquee") {
+        if (e.point.getDistance(drag.origin) < screen(3)) return;
+        drag.rect?.remove();
+        const box = new scope.Rectangle(
+          Math.min(drag.origin.x, e.point.x),
+          Math.min(drag.origin.y, e.point.y),
+          Math.abs(e.point.x - drag.origin.x),
+          Math.abs(e.point.y - drag.origin.y),
+        );
+        const rect = new scope.Path.Rectangle(box);
+        rect.strokeColor = new scope.Color("#1e88e5");
+        rect.strokeWidth = screen(1);
+        rect.dashArray = [screen(5), screen(4)];
+        rect.fillColor = new scope.Color(0.12, 0.53, 0.9, 0.12);
+        rect.locked = true;
+        rect.bringToFront();
+        drag.rect = rect;
+        return;
+      }
+      if (drag.kind === "nodes") {
+        if (!drag.started) {
+          if (e.point.getDistance(drag.origin) < screen(3)) return;
+          pushUndo();
+          drag.started = true;
+          selectedSegmentRef.current = null;
+        }
+        const grabbedAt = drag.indices.indexOf(drag.grabbed);
+        const grabbedStart = drag.starts[grabbedAt] ?? drag.starts[0];
+        const delta = maybeSnap(e.point).subtract(grabbedStart);
+        for (let k = 0; k < drag.indices.length; k++) {
+          const seg = drag.meta.path.segments[drag.indices[k]];
+          const start = drag.starts[k];
+          if (seg && start) seg.point = start.add(delta);
+        }
+        const n = drag.meta.path.segments.length;
+        const open = !drag.meta.path.closed;
+        const only = drag.indices.length === 1 ? drag.indices[0] : -1;
+        rebuildEditGizmos();
+        if (open && (only === 0 || only === n - 1)) {
+          const which = only === 0 ? "first" : "last";
+          const hit = findOpenEndNear(e.point, {
+            meta: drag.meta,
+            which,
+          });
+          const blue = new Set<number>();
+          if (hit) {
+            blue.add(only);
+            if (hit.meta === drag.meta) {
+              blue.add(which === "first" ? n - 1 : 0);
+            }
+            showMagnet(hit.point);
+          } else clearMagnet();
+          applyEndpointColors(blue.size ? blue : null);
+          paintPointSelection();
+        }
+        return;
+      }
       if (drag.kind === "node") {
         if (!drag.started) {
           if (e.point.getDistance(drag.origin) < screen(3)) return;
@@ -4479,9 +5190,105 @@ export function DrawCanvas({
               m.smooth = detectSmoothFlags(m.path);
             }
             syncStampChrome();
-            setSelection(drag.meta, true);
+            if (
+              drag.kind === "xform-move" &&
+              drag.keepMulti &&
+              drag.keepMulti.length > 1
+            ) {
+              const still = drag.keepMulti.filter((m) =>
+                metasRef.current.includes(m),
+              );
+              setMultiSelection(still, drag.meta, true);
+            } else {
+              setSelection(drag.meta, true);
+            }
           }
           clearCurveHover();
+          return;
+        }
+        if (drag.kind === "select-rect") {
+          drag.rect?.remove();
+          const box = new scope.Rectangle(
+            Math.min(drag.origin.x, e.point.x),
+            Math.min(drag.origin.y, e.point.y),
+            Math.abs(e.point.x - drag.origin.x),
+            Math.abs(e.point.y - drag.origin.y),
+          );
+          const tiny = box.width < screen(4) && box.height < screen(4);
+          if (tiny) {
+            if (!drag.shift && !drag.ctrl) setSelection(null, false);
+            return;
+          }
+          // Left → right: only curves fully inside. Right → left: anything touched.
+          const crossing = e.point.x < drag.origin.x;
+          const hits = selectableCurves().filter((m) =>
+            curveInMarquee(m, box, crossing),
+          );
+          const cur = activeSelection().filter((m) => !m.stampRim);
+          if (drag.ctrl) {
+            const drop = new Set(hits);
+            const next = cur.filter((m) => !drop.has(m));
+            setMultiSelection(next, next[next.length - 1] ?? null, false);
+          } else if (drag.shift) {
+            const next = [...cur];
+            for (const h of hits) if (!next.includes(h)) next.push(h);
+            setMultiSelection(next, next[next.length - 1] ?? null, false);
+          } else {
+            setMultiSelection(hits, hits[hits.length - 1] ?? null, false);
+          }
+          return;
+        }
+        if (drag.kind === "marquee") {
+          drag.rect?.remove();
+          const box = new scope.Rectangle(
+            Math.min(drag.origin.x, e.point.x),
+            Math.min(drag.origin.y, e.point.y),
+            Math.abs(e.point.x - drag.origin.x),
+            Math.abs(e.point.y - drag.origin.y),
+          );
+          const tiny = box.width < screen(4) && box.height < screen(4);
+          if (tiny) {
+            setSelectedPoints([]);
+            selectedSegmentRef.current = null;
+            clearCurveHover();
+            const other = pickEditableMeta(e.point);
+            if (other && other !== drag.meta) setSelection(other, false);
+            else setSelection(drag.meta, false);
+            return;
+          }
+          const indices: number[] = [];
+          drag.meta.path.segments.forEach((seg, i) => {
+            if (box.contains(seg.point)) indices.push(i);
+          });
+          selectedSegmentRef.current = null;
+          setSelectedPoints(indices);
+          setSelection(drag.meta, false);
+          return;
+        }
+        if (drag.kind === "nodes") {
+          selectedSegmentRef.current = null;
+          const meta = drag.meta;
+          if (!drag.started) {
+            setSelection(meta, false);
+            clearMagnet();
+            return;
+          }
+          const n = meta.path.segments.length;
+          const only = drag.indices.length === 1 ? drag.indices[0] : -1;
+          if (!meta.path.closed && (only === 0 || only === n - 1)) {
+            const which = only === 0 ? "first" : "last";
+            const hit = findOpenEndNear(e.point, { meta, which });
+            if (hit) {
+              meta.path.segments[only].point = hit.point.clone();
+              setSelectedPoints([]);
+              mergeCloseEdit(meta, which);
+              clearMagnet();
+              return;
+            }
+          }
+          meta.raw = cloneRaw(meta.path);
+          clearMagnet();
+          setSelection(meta, true);
           return;
         }
         if (drag.kind === "node") {
@@ -4693,6 +5500,11 @@ export function DrawCanvas({
           ev.preventDefault();
           return;
         }
+        if (letter === "f") {
+          extras.__toggleFeatureFill?.();
+          ev.preventDefault();
+          return;
+        }
       }
       if ((ev.key === "z" || ev.key === "Z") && (ev.ctrlKey || ev.metaKey)) {
         if (
@@ -4729,11 +5541,98 @@ export function DrawCanvas({
         void flushDraftSave({ toast: true });
       }
       if (
+        (ev.key === "c" || ev.key === "C") &&
+        (ev.ctrlKey || ev.metaKey) &&
+        !ev.shiftKey &&
+        !ev.altKey &&
+        (modeRef.current === "edit" || modeRef.current === "curveEdit")
+      ) {
+        if (extras.__copyCurve?.()) ev.preventDefault();
+      }
+      if (
         (ev.key === "Delete" || ev.key === "Backspace") &&
         (modeRef.current === "edit" || modeRef.current === "curveEdit")
       ) {
         extras.__deleteHoverPoint?.();
         ev.preventDefault();
+      }
+      // Nudge selection: 0.5 mm, Shift = 2 mm, Ctrl/Cmd = 0.05 mm
+      if (
+        (ev.key === "ArrowLeft" ||
+          ev.key === "ArrowRight" ||
+          ev.key === "ArrowUp" ||
+          ev.key === "ArrowDown") &&
+        (modeRef.current === "edit" || modeRef.current === "curveEdit") &&
+        !dragRef.current
+      ) {
+        const meta = selectedRef.current;
+        if (
+          meta &&
+          !meta.stampRim &&
+          !meta.derivedFromId &&
+          meta.path.segments.length >= 1
+        ) {
+          const stepMm =
+            ev.ctrlKey || ev.metaKey ? 0.05 : ev.shiftKey ? 2 : 0.5;
+          const mm = mmPerPxRef.current > 1e-9 ? mmPerPxRef.current : 1;
+          const dx =
+            ((ev.key === "ArrowLeft" ? -1 : ev.key === "ArrowRight" ? 1 : 0) *
+              stepMm) /
+            mm;
+          const dy =
+            ((ev.key === "ArrowUp" ? -1 : ev.key === "ArrowDown" ? 1 : 0) *
+              stepMm) /
+            mm;
+          const delta = new scope.Point(dx, dy);
+
+          let pointIndices =
+            modeRef.current === "curveEdit"
+              ? [...selectedPointsRef.current]
+              : [];
+          if (
+            modeRef.current === "curveEdit" &&
+            !pointIndices.length &&
+            selectedPointRef.current?.meta === meta
+          ) {
+            pointIndices = [selectedPointRef.current.index];
+          }
+
+          if (!ev.repeat) pushUndo();
+          if (pointIndices.length) {
+            for (const index of pointIndices) {
+              const seg = meta.path.segments[index];
+              if (seg) seg.point = seg.point.add(delta);
+            }
+            meta.raw = cloneRaw(meta.path);
+          } else {
+            const movers =
+              modeRef.current === "edit" && activeSelection().length > 1
+                ? activeSelection()
+                : [meta];
+            const seen = new Set<PathMeta>();
+            for (const item of movers) {
+              if (seen.has(item)) continue;
+              item.path.translate(delta);
+              item.raw = cloneRaw(item.path);
+              seen.add(item);
+              for (const linked of linkedWithCutter(item)) {
+                if (seen.has(linked)) continue;
+                linked.path.translate(delta);
+                linked.raw = cloneRaw(linked.path);
+                seen.add(linked);
+              }
+            }
+            syncStampChrome();
+            if (movers.length > 1) {
+              setMultiSelection(movers, meta, true);
+              ev.preventDefault();
+              return;
+            }
+          }
+          syncStampChrome();
+          setSelection(meta, true);
+          ev.preventDefault();
+        }
       }
     };
     const defaultCursor = () => {
@@ -4762,6 +5661,12 @@ export function DrawCanvas({
 
     extras.__setMode = () => {
       drawingRef.current = null;
+      if (
+        dragRef.current?.kind === "marquee" ||
+        dragRef.current?.kind === "select-rect"
+      ) {
+        dragRef.current.rect?.remove();
+      }
       dragRef.current = null;
       continueMetaRef.current = null;
       polyHandleDragRef.current = null;
@@ -4832,6 +5737,10 @@ export function DrawCanvas({
       emitClosed(true);
     };
 
+    extras.__resampleMesh = () => {
+      emitClosedNow();
+    };
+
     extras.__toggleStamp = () => {
       if (stampOwnerRef.current) {
         const owner = stampOwnerRef.current;
@@ -4858,7 +5767,8 @@ export function DrawCanvas({
             (selectedRef.current?.role !== "feature"
               ? selectedRef.current
               : null);
-      if (!owner || !owner.stampId || owner.stampPlate || owner.derivedFromId) return;
+      // stampPlate is never the stamp owner; derived cutters (Add cutter) can be.
+      if (!owner || !owner.stampId || owner.stampPlate) return;
       ensureId(owner);
       pushUndo();
       const ownerId = owner.id!;
@@ -4876,14 +5786,20 @@ export function DrawCanvas({
       selectedPointRef.current = null;
       clearCurveHover();
       syncStampChrome();
-      setSelection(owner, true);
+      // Prefer the editable plate when the stamp lived on a derived cutter.
+      setSelection(plateFor(owner) ?? owner, true);
       notifyMaybeEmpty();
     };
 
     extras.__setFeatureWidth = (widthMm: number) => {
       const m = selectedRef.current;
       if (!m || m.role !== "feature") return;
-      const w = Math.max(0.3, widthMm);
+      // Rim outline keeps a real width; feature strokes may be hairline (0).
+      const w = m.stampRim
+        ? Math.max(0.3, widthMm)
+        : widthMm <= 0
+          ? 0
+          : Math.max(0.3, widthMm);
       if (m.stampRim) {
         m.widthMm = w;
         onOutlineWidthChangeRef.current(w);
@@ -4909,16 +5825,29 @@ export function DrawCanvas({
         return;
       }
       m.widthMm = w;
-      lastWidthMm.current = w;
+      if (w > 0) lastWidthMm.current = w;
       styleFeature(m);
       refreshFeatureHud();
+      rebuildEditGizmos();
       emitClosed(true);
     };
 
     extras.__setFeatureRaised = (raised: boolean) => {
       const m = selectedRef.current;
       if (!m || m.role !== "feature" || m.stampRim) return;
+      m.hole = false;
       m.raised = raised;
+      styleFeature(m);
+      syncStampChrome();
+      refreshFeatureHud();
+      emitClosed(true);
+    };
+
+    extras.__setFeatureHole = () => {
+      const m = selectedRef.current;
+      if (!m || m.role !== "feature" || m.stampRim) return;
+      m.hole = true;
+      if (m.path.closed) m.filled = true;
       styleFeature(m);
       syncStampChrome();
       refreshFeatureHud();
@@ -4996,14 +5925,12 @@ export function DrawCanvas({
 
     /** Drawn curve stays the stamp rim; a locked cutter is built outside it. */
     extras.__addCutterAroundOutline = () => {
-      const meta = selectedRef.current;
+      // Same target as Add stamp: selected closed cutter, or the sole one.
+      const meta = resolveStampTarget();
       if (
         !meta ||
-        meta.role === "feature" ||
-        meta.stampPlate ||
-        meta.derivedFromId ||
+        !isCutterShape(meta) ||
         meta.stampId ||
-        meta.stampRim ||
         !meta.path.closed ||
         meta.path.segments.length < 3
       ) {
@@ -5013,8 +5940,6 @@ export function DrawCanvas({
         samplePlatePts(meta.path),
         cutterOutsetPx(),
         0.05,
-        JoinType.Miter,
-        8,
       );
       if (!loop || loop.length < 3) return;
       pushUndo();
@@ -5222,7 +6147,8 @@ export function DrawCanvas({
         } else if (cls.role === "feature") {
           meta.role = "feature";
           meta.raised = cls.raised;
-          meta.filled = !!src?.filled;
+          meta.hole = !!cls.hole;
+          meta.filled = !!src?.filled || !!cls.hole;
           meta.widthMm = src?.widthMm ?? 0.6;
           styleFeature(meta);
         } else {
@@ -5301,7 +6227,9 @@ export function DrawCanvas({
       pendingDraftRestoreRef.current = null;
       applyDraftItems(pending.items, pending.stampOwnerId);
       draftRestoringRef.current = false;
-      onDraftSavedRef.current?.("Restored sketch from this browser");
+      if (!pending.quiet) {
+        onDraftSavedRef.current?.("Restored sketch from this browser");
+      }
       void flushDraftSave();
     };
 
@@ -5376,9 +6304,14 @@ export function DrawCanvas({
             segments: toSegs(m),
             role: "feature",
             raised,
+            hole: !!m.hole,
             filled: !!m.filled,
             widthMm: m.widthMm ?? 0.6,
-            strokeRgb: raised ? STAMP_RAISE_RGB : STAMP_RECESS_RGB,
+            strokeRgb: m.hole
+              ? STAMP_HOLE_RGB
+              : raised
+                ? STAMP_RAISE_RGB
+                : STAMP_RECESS_RGB,
           });
         } else {
           paths.push({
@@ -5491,7 +6424,198 @@ export function DrawCanvas({
         stampGapMm: gapMmRef.current,
         stampOutlineEnabled: outlineEnabledRef.current,
         stampOutlineWidthMm: outlineWidthMmRef.current,
+        projectName: projectNameRef.current,
       });
+    };
+
+    const pdfBytesFor = (
+      paths: ImportedPath[],
+      mm: number | null,
+      stamp: StampParams,
+      name: string,
+      background: SketchPdfBackground | null,
+    ): Uint8Array | null => {
+      if (!paths.length) return null;
+      try {
+        return buildSketchPdf(paths, {
+          mmPerPx: mm,
+          background,
+          stampGapMm: stamp.gapMm,
+          stampOutlineEnabled: stamp.outlineEnabled,
+          stampOutlineWidthMm: stamp.outlineWidthMm,
+          projectName: name,
+        });
+      } catch {
+        return null;
+      }
+    };
+
+    /** Sample a stored tab without putting its paths on the visible canvas. */
+    const withDraftMetas = <T,>(
+      items: SketchDraftItem[],
+      stampOwnerId: string | null,
+      stamp: StampParams,
+      mm: number | null,
+      fn: () => T,
+    ): T => {
+      const metas: PathMeta[] = [];
+      for (const item of items) {
+        if (!item.raw || item.raw.length < 2) continue;
+        const path = new scope.Path({ insert: false });
+        path.closed = item.closed;
+        applyRaw(path, item.raw, scope);
+        metas.push({
+          path,
+          raw: item.raw,
+          smooth: item.smooth?.length
+            ? item.smooth
+            : path.segments.map(() => false),
+          lockIndex: item.lockIndex ?? 0,
+          simplifyTol: item.simplifyTol,
+          noSimplify: item.noSimplify,
+          id: item.id,
+          role: item.role,
+          stampId: item.stampId,
+          ownerId: item.ownerId,
+          raised: item.raised,
+          hole: item.hole,
+          widthMm: item.widthMm,
+          filled: item.filled,
+          stampPlate: item.stampPlate,
+          derivedFromId: item.derivedFromId,
+        });
+      }
+      const prev = {
+        metas: metasRef.current,
+        stamp: stampRef.current,
+        mm: mmPerPxRef.current,
+        gap: gapMmRef.current,
+        outline: outlineEnabledRef.current,
+        outlineW: outlineWidthMmRef.current,
+        sel: selectedRef.current,
+        owner: stampOwnerRef.current,
+      };
+      metasRef.current = metas;
+      selectedRef.current = null;
+      const owner = stampOwnerId
+        ? (metas.find((m) => m.id === stampOwnerId) ?? null)
+        : null;
+      stampOwnerRef.current = owner && owner.path.closed ? owner : null;
+      stampRef.current = stamp;
+      if (mm != null && mm > 0) mmPerPxRef.current = mm;
+      gapMmRef.current = stamp.gapMm;
+      outlineEnabledRef.current = stamp.outlineEnabled;
+      outlineWidthMmRef.current = stamp.outlineWidthMm;
+      try {
+        return fn();
+      } finally {
+        for (const m of metas) m.path.remove();
+        metasRef.current = prev.metas;
+        stampRef.current = prev.stamp;
+        mmPerPxRef.current = prev.mm;
+        gapMmRef.current = prev.gap;
+        outlineEnabledRef.current = prev.outline;
+        outlineWidthMmRef.current = prev.outlineW;
+        selectedRef.current = prev.sel;
+        stampOwnerRef.current = prev.owner;
+      }
+    };
+
+    extras.__collectZipSketches = async () => {
+      await flushDraftSave();
+      const out: ZipSketchPart[] = [];
+      const activeId = activeSketchIdRef.current;
+      for (const tab of sketchTabsRef.current) {
+        if (tab.id === activeId) {
+          rebuildDerivedCutters();
+          const mesh = closedMeshSnapshot();
+          const payload = await buildSketchPdfPayload();
+          const stamp = { ...(stampRef.current ?? DEFAULT_STAMP) };
+          const mm = mmPerPxRef.current > 0 ? mmPerPxRef.current : null;
+          const pdf = payload
+            ? pdfBytesFor(
+                payload.paths,
+                mm,
+                stamp,
+                projectNameRef.current,
+                payload.background,
+              )
+            : null;
+          if (!pdf && !mesh.pts) continue;
+          out.push({
+            name: projectNameRef.current,
+            pdf,
+            pts: mesh.pts,
+            features: mesh.features,
+            stamp,
+            outlinePx: mesh.outlinePx,
+            mmPerPx: mm,
+          });
+          continue;
+        }
+        const draft = await loadTabDraft(tab.id);
+        if (!draft || !draft.meta.items.some((it) => it.raw.length >= 2)) {
+          continue;
+        }
+        const captured = withDraftMetas(
+          draft.meta.items,
+          draft.meta.stampOwnerId,
+          draft.meta.stamp,
+          draft.meta.mmPerPx,
+          () => {
+            rebuildDerivedCutters();
+            return {
+              paths: collectSketchPaths(),
+              mesh: closedMeshSnapshot(),
+              mm: mmPerPxRef.current > 0 ? mmPerPxRef.current : null,
+            };
+          },
+        );
+        let background: SketchPdfBackground | null = null;
+        const place = draft.meta.bgPlace;
+        if (
+          draft.background &&
+          place &&
+          place.width > 0 &&
+          place.height > 0
+        ) {
+          const url = URL.createObjectURL(draft.background);
+          try {
+            const enc = await jpegFromImageUrl(url);
+            background = {
+              jpeg: enc.jpeg,
+              widthPx: enc.width,
+              heightPx: enc.height,
+              left: place.x,
+              top: place.y,
+              width: place.width,
+              height: place.height,
+            };
+          } catch {
+            background = null;
+          } finally {
+            URL.revokeObjectURL(url);
+          }
+        }
+        const pdf = pdfBytesFor(
+          captured.paths,
+          captured.mm,
+          draft.meta.stamp,
+          tab.name,
+          background,
+        );
+        if (!pdf && !captured.mesh.pts) continue;
+        out.push({
+          name: tab.name,
+          pdf,
+          pts: captured.mesh.pts,
+          features: captured.mesh.features,
+          stamp: draft.meta.stamp,
+          outlinePx: captured.mesh.outlinePx,
+          mmPerPx: captured.mm,
+        });
+      }
+      return out;
     };
 
     extras.__saveSketchPdf = async () => {
@@ -5501,16 +6625,284 @@ export function DrawCanvas({
         return;
       }
       void flushDraftSave();
-      return downloadSketchPdf(payload.paths, "pernicek.pdf", {
+      const names = projectExportNames(projectNameRef.current);
+      return downloadSketchPdf(payload.paths, names.pdf, {
         mmPerPx: mmPerPxRef.current,
         background: payload.background,
         stampGapMm: gapMmRef.current,
         stampOutlineEnabled: outlineEnabledRef.current,
         stampOutlineWidthMm: outlineWidthMmRef.current,
+        projectName: projectNameRef.current,
       });
     };
 
-    extras.__importVectorFile = async (file: File) => {
+    type CurveClip = {
+      raw: SegSnap[];
+      smooth: boolean[];
+      closed: boolean;
+      noSimplify?: boolean;
+      simplifyTol?: number;
+      role?: "feature";
+      raised?: boolean;
+      hole?: boolean;
+      widthMm?: number;
+      filled?: boolean;
+    };
+    const curveClip: { current: CurveClip | null } = { current: null };
+    const curveClips: { current: CurveClip[] } = { current: [] };
+    /** Repeated paste steps the copy so it doesn't sit on the original. */
+    let pasteStep = 0;
+    /** True until our clipboard write finishes, so a fast Ctrl+V still pastes the curve. */
+    let ownCopyPending = false;
+    /** One paste uses the in-app copy when writing the clipboard failed. */
+    let forceInternalPaste = false;
+
+    const curveToSvg = (paths: paper.Path[]) => {
+      const body = paths
+        .map((path) => {
+          const d = path.pathData.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+          return `<path d="${d}"/>`;
+        })
+        .join("");
+      return `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" data-cookieshaper="copy">${body}</svg>`;
+    };
+
+    const clipOf = (meta: PathMeta): CurveClip => ({
+      raw: cloneRaw(meta.path),
+      smooth: [...meta.smooth],
+      closed: meta.path.closed,
+      noSimplify: meta.noSimplify,
+      simplifyTol: meta.simplifyTol,
+      role: meta.role === "feature" ? "feature" : undefined,
+      raised: meta.raised,
+      hole: meta.hole,
+      widthMm: meta.widthMm,
+      filled: meta.filled,
+    });
+
+    const extractSvg = (raw: string) => {
+      const start = raw.search(/<svg[\s>/]/i);
+      if (start < 0) return null;
+      const end = raw.toLowerCase().lastIndexOf("</svg>");
+      if (end < start) return null;
+      return raw.slice(start, end + "</svg>".length);
+    };
+
+    const clipboardSvg = (dt: DataTransfer) => {
+      const types = Array.from(dt.types);
+      const order = [
+        "image/svg+xml",
+        "image/x-inkscape-svg",
+        "text/plain",
+        "text/html",
+        ...types,
+      ];
+      const seen = new Set<string>();
+      for (const t of order) {
+        if (seen.has(t)) continue;
+        seen.add(t);
+        let data = "";
+        try {
+          data = dt.getData(t);
+        } catch {
+          continue;
+        }
+        const svg = data ? extractSvg(data) : null;
+        if (svg) return svg;
+      }
+      return null;
+    };
+
+    const adoptPastedPath = (
+      path: paper.Path,
+      feature: Pick<CurveClip, "role" | "raised" | "hole" | "widthMm" | "filled"> | null,
+    ) => {
+      path.strokeCap = "round";
+      path.strokeJoin = "round";
+      path.strokeScaling = true;
+      path.fillColor = null;
+      path.opacity = 1;
+      const meta: PathMeta = {
+        path,
+        raw: cloneRaw(path),
+        smooth: feature?.role === "feature" ? [] : detectSmoothFlags(path),
+        lockIndex: 0,
+      };
+      if (feature?.role === "feature") {
+        meta.smooth = detectSmoothFlags(path);
+        meta.raised = feature.raised;
+        meta.hole = feature.hole;
+        meta.filled = feature.filled;
+        meta.widthMm = feature.widthMm;
+      }
+      metasRef.current.push(meta);
+      if (stampOwnerRef.current) tagFeature(meta);
+      else if (path.closed) {
+        path.strokeColor = new scope.Color("#c45c26");
+        path.strokeWidth = 2.2;
+      } else {
+        path.strokeColor = new scope.Color("#111");
+        path.strokeWidth = 1.5;
+      }
+      return meta;
+    };
+
+    const placePathsInView = (paths: paper.Path[]) => {
+      const b = pathGroupBounds(paths);
+      if (!b) return;
+      const view = scope.view.bounds;
+      let center = b.center.clone();
+      if (b.width > view.width * 0.8 || b.height > view.height * 0.8) {
+        const s = Math.min((view.width * 0.7) / b.width, (view.height * 0.7) / b.height);
+        if (s > 0 && s < 1) {
+          for (const p of paths) p.scale(s, center);
+          center = pathGroupBounds(paths)?.center.clone() ?? center;
+        }
+      }
+      const delta = scope.view.center.subtract(center);
+      if (delta.length > 0.5) {
+        for (const p of paths) p.translate(delta);
+      }
+    };
+
+    extras.__copyCurve = () => {
+      const list = activeSelection().filter(
+        (meta) =>
+          metasRef.current.includes(meta) &&
+          !meta.stampRim &&
+          !meta.derivedFromId &&
+          meta.path.segments.length >= 2,
+      );
+      if (!list.length) return false;
+      const clips = list.map(clipOf);
+      curveClips.current = clips;
+      curveClip.current = clips[0] ?? null;
+      pasteStep = 0;
+      ownCopyPending = true;
+      forceInternalPaste = false;
+      const svg = curveToSvg(list.map((m) => m.path));
+      const write = navigator.clipboard?.writeText?.(svg);
+      if (write) {
+        void write.then(
+          () => {
+            ownCopyPending = false;
+          },
+          () => {
+            ownCopyPending = false;
+            forceInternalPaste = true;
+          },
+        );
+      } else {
+        ownCopyPending = false;
+        forceInternalPaste = true;
+      }
+      return true;
+    };
+
+    const pasteClips = (clips: CurveClip[]) => {
+      if (!clips.length) return;
+      pasteStep += 1;
+      const step = new scope.Point(screen(16) * pasteStep, screen(16) * pasteStep);
+      pushUndo();
+      const made: PathMeta[] = [];
+      for (const clip of clips) {
+        const path = new scope.Path({
+          strokeCap: "round",
+          strokeJoin: "round",
+          fillColor: null,
+        });
+        applyRaw(path, clip.raw, scope);
+        path.closed = clip.closed;
+        path.translate(step);
+        const meta = adoptPastedPath(path, clip.role === "feature" ? clip : null);
+        meta.smooth = clip.smooth.length ? [...clip.smooth] : detectSmoothFlags(path);
+        meta.noSimplify = clip.noSimplify;
+        meta.simplifyTol = clip.simplifyTol;
+        meta.raw = cloneRaw(path);
+        made.push(meta);
+      }
+      syncStampChrome();
+      setMultiSelection(made, made[made.length - 1] ?? null, true);
+      syncEmpty();
+      if (made.some((m) => m.path.closed)) notifyClosedCurve();
+    };
+
+    const pasteSvgMarkup = (svg: string) => {
+      const imported = scope.project.importSVG(svg, {
+        expandShapes: true,
+        applyMatrix: true,
+        insert: true,
+      }) as paper.Item | null;
+      if (!imported) return false;
+      const found: paper.Path[] = [];
+      collectSvgPaths(imported, found);
+      const clean: paper.Path[] = [];
+      for (const src of found) {
+        if (src.segments.length < 2) continue;
+        const world = src.globalMatrix.clone();
+        const p = makeSketchPath(
+          src.segments.map((seg) => seg.clone()),
+          !!src.closed,
+        );
+        p.transform(world);
+        clean.push(p);
+      }
+      imported.remove();
+      if (!clean.length) return false;
+      placePathsInView(clean);
+      pushUndo();
+      const made: PathMeta[] = [];
+      for (const p of clean) made.push(adoptPastedPath(p, null));
+      syncStampChrome();
+      if (made.length) setMultiSelection(made, made[made.length - 1], true);
+      syncEmpty();
+      if (clean.some((p) => p.closed)) notifyClosedCurve();
+      return true;
+    };
+
+    const onPaste = (ev: ClipboardEvent) => {
+      if (isTypingTarget(ev.target)) return;
+      if (modeRef.current !== "edit" && modeRef.current !== "curveEdit") return;
+      const svg = ev.clipboardData ? clipboardSvg(ev.clipboardData) : null;
+      const foreign = !!svg && !/data-cookieshaper=["']copy["']/.test(svg);
+      if (
+        (ownCopyPending || forceInternalPaste) &&
+        (curveClips.current.length || curveClip.current)
+      ) {
+        forceInternalPaste = false;
+        ev.preventDefault();
+        pasteClips(
+          curveClips.current.length
+            ? curveClips.current
+            : curveClip.current
+              ? [curveClip.current]
+              : [],
+        );
+        return;
+      }
+      if (foreign && svg && pasteSvgMarkup(svg)) {
+        ev.preventDefault();
+        return;
+      }
+      if (curveClips.current.length || curveClip.current) {
+        ev.preventDefault();
+        pasteClips(
+          curveClips.current.length
+            ? curveClips.current
+            : curveClip.current
+              ? [curveClip.current]
+              : [],
+        );
+      }
+    };
+
+    extras.__importVectorFile = async (
+      file: File,
+      opts?: { preferredName?: string },
+    ) => {
+      // New tab first — never rename the previous tab from the incoming file.
+      if (canvasHasContent()) await openFreshTab();
+      const preferred = opts?.preferredName?.trim() || null;
       const name = file.name.toLowerCase();
       try {
         if (name.endsWith(".svg") || file.type === "image/svg+xml") {
@@ -5541,6 +6933,9 @@ export function DrawCanvas({
             svg,
             b ? { width: b.width, height: b.height } : null,
           );
+          onProjectNameChangeRef.current(
+            preferred || projectNameFromFilename(file.name),
+          );
           commitImportedPaths(clean, scale);
           return;
         }
@@ -5552,7 +6947,11 @@ export function DrawCanvas({
             stampGapMm,
             stampOutlineEnabled,
             stampOutlineWidthMm,
+            projectName: pdfTitle,
           } = await pathsFromPdfFile(file);
+          onProjectNameChangeRef.current(
+            preferred || pdfTitle || projectNameFromFilename(file.name),
+          );
           const { paths, kept } = pathsFromImported(imported);
           if (!paths.length) throw new Error("No vector paths found in PDF");
           if (stampGapMm != null) onStampGapChangeRef.current(stampGapMm);
@@ -5607,6 +7006,7 @@ export function DrawCanvas({
     window.addEventListener("mouseup", onNativeUp);
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("paste", onPaste);
     const onPageHide = () => {
       if (draftSavePending || metasRef.current.length > 0) {
         void flushDraftSave();
@@ -5618,32 +7018,209 @@ export function DrawCanvas({
     window.addEventListener("pagehide", onPageHide);
     document.addEventListener("visibilitychange", onVisChange);
 
-    // Restore last sketch from IndexedDB (paths + optional background)
+    const historyByTab = new Map<string, { undo: Snapshot[]; redo: Snapshot[] }>();
+    let tabBusy = false;
+
+    const canvasHasContent = () =>
+      metasRef.current.some((m) => m.path.segments.length >= 1) ||
+      !!drawingRef.current ||
+      !!(polygonRef.current && polygonRef.current.segments.length > 0) ||
+      !!bgRef.current ||
+      !!backgroundUrlRef.current;
+
+    const rememberHistory = () => {
+      const id = activeSketchIdRef.current;
+      if (!id) return;
+      historyByTab.set(id, {
+        undo: undoRef.current,
+        redo: redoRef.current,
+      });
+    };
+
+    const adoptHistory = (id: string) => {
+      let h = historyByTab.get(id);
+      if (!h) {
+        h = { undo: [], redo: [] };
+        historyByTab.set(id, h);
+      }
+      undoRef.current = h.undo;
+      redoRef.current = h.redo;
+      notifyHistory();
+    };
+
+    const publishTabs = (tabs: SketchTab[], activeId: string) => {
+      activeSketchIdRef.current = activeId;
+      sketchTabsRef.current = tabs;
+      setSketchTabs(tabs);
+      setActiveSketchId(activeId);
+      onSketchTabsChangeRef.current?.(tabs, activeId);
+    };
+
+    const loadTabIntoCanvas = async (id: string, quiet: boolean) => {
+      draftRestoringRef.current = true;
+      const draft = await loadTabDraft(id);
+      if (scopeRef.current !== scope) return;
+      if (!draft) {
+        draftRestoringRef.current = false;
+        return;
+      }
+      onStampChangeRef.current(draft.meta.stamp);
+      if (draft.meta.mmPerPx != null) onMmPerPxChangeRef.current(draft.meta.mmPerPx);
+      if (draft.background) {
+        const blobUrl = URL.createObjectURL(draft.background);
+        if (draft.meta.bgPlace) bgPlaceRef.current = { ...draft.meta.bgPlace };
+        pendingDraftRestoreRef.current = {
+          items: draft.meta.items,
+          stampOwnerId: draft.meta.stampOwnerId,
+          mmPerPx: draft.meta.mmPerPx,
+          quiet,
+        };
+        onImportBgRef.current(blobUrl);
+      } else {
+        if (backgroundUrlRef.current || bgRef.current) onClearBackgroundRef.current();
+        applyDraftItems(draft.meta.items, draft.meta.stampOwnerId);
+        draftRestoringRef.current = false;
+        if (!quiet) onDraftSavedRef.current?.("Restored sketch from this browser");
+      }
+    };
+
+    const openFreshTab = async () => {
+      if (tabBusy || !activeSketchIdRef.current) return;
+      tabBusy = true;
+      try {
+        rememberHistory();
+        await flushDraftSave();
+        const id = newSketchTabId();
+        // Keep the previous tab's stored title — do not pull from projectName
+        // (import may already have staged a new title in React state).
+        const tabs = [
+          ...sketchTabsRef.current,
+          { id, name: DEFAULT_PROJECT_NAME },
+        ];
+        await saveSketchTabIndex({ activeId: id, tabs });
+        publishTabs(tabs, id);
+        adoptHistory(id);
+        wipeSketch();
+        skipNameSyncRef.current = true;
+        onProjectNameChangeRef.current(DEFAULT_PROJECT_NAME);
+      } finally {
+        tabBusy = false;
+      }
+    };
+
+    const switchSketchTab = async (id: string) => {
+      if (tabBusy || !activeSketchIdRef.current || !id || id === activeSketchIdRef.current) return;
+      const target = sketchTabsRef.current.find((t) => t.id === id);
+      if (!target) return;
+      tabBusy = true;
+      try {
+        rememberHistory();
+        await flushDraftSave();
+        const tabs = sketchTabsRef.current.map((t) =>
+          t.id === activeSketchIdRef.current
+            ? { ...t, name: projectNameRef.current }
+            : t,
+        );
+        await saveSketchTabIndex({ activeId: id, tabs });
+        publishTabs(tabs, id);
+        adoptHistory(id);
+        wipeSketch({ background: false });
+        skipNameSyncRef.current = true;
+        onProjectNameChangeRef.current(target.name);
+        await loadTabIntoCanvas(id, true);
+      } finally {
+        tabBusy = false;
+      }
+    };
+
+    const closeTabNow = async (id: string) => {
+      const tabs = sketchTabsRef.current;
+      const idx = tabs.findIndex((t) => t.id === id);
+      if (idx < 0) return;
+      historyByTab.delete(id);
+      await deleteTabDraft(id);
+      if (tabs.length === 1) {
+        const blank = { undo: [] as Snapshot[], redo: [] as Snapshot[] };
+        historyByTab.set(id, blank);
+        undoRef.current = blank.undo;
+        redoRef.current = blank.redo;
+        notifyHistory();
+        wipeSketch();
+        skipNameSyncRef.current = true;
+        onProjectNameChangeRef.current(DEFAULT_PROJECT_NAME);
+        publishTabs([{ id, name: DEFAULT_PROJECT_NAME }], id);
+        await saveSketchTabIndex({
+          activeId: id,
+          tabs: [{ id, name: DEFAULT_PROJECT_NAME }],
+        });
+        await clearSketchDraft();
+        return;
+      }
+      const nextTabs = tabs.filter((t) => t.id !== id);
+      const next =
+        id === activeSketchIdRef.current
+          ? (nextTabs[Math.min(idx, nextTabs.length - 1)] ?? nextTabs[0])
+          : nextTabs.find((t) => t.id === activeSketchIdRef.current) ?? nextTabs[0];
+      await saveSketchTabIndex({ activeId: next.id, tabs: nextTabs });
+      if (id !== activeSketchIdRef.current) {
+        publishTabs(nextTabs, activeSketchIdRef.current ?? next.id);
+        return;
+      }
+      publishTabs(nextTabs, next.id);
+      adoptHistory(next.id);
+      wipeSketch({ background: false });
+      skipNameSyncRef.current = true;
+      onProjectNameChangeRef.current(next.name);
+      await loadTabIntoCanvas(next.id, true);
+    };
+
+    extras.__openFreshTab = openFreshTab;
+    extras.__switchSketchTab = switchSketchTab;
+    extras.__confirmCloseTab = async (id: string) => {
+      if (tabBusy) return;
+      tabBusy = true;
+      try {
+        await closeTabNow(id);
+      } finally {
+        tabBusy = false;
+      }
+    };
+    extras.__requestCloseTab = async (id: string) => {
+      if (!activeSketchIdRef.current) return;
+      const live = id === activeSketchIdRef.current;
+      const empty = live ? !canvasHasContent() : !(await loadTabDraft(id));
+      if (empty) {
+        if (sketchTabsRef.current.length === 1) return;
+        await extras.__confirmCloseTab?.(id);
+        return;
+      }
+      if (loadCloseTabConfirmHidden()) {
+        await extras.__confirmCloseTab?.(id);
+        return;
+      }
+      const tab = sketchTabsRef.current.find((t) => t.id === id);
+      setClosePdfSaved(false);
+      setCloseDontAsk(false);
+      setCloseSketch(tab ?? { id, name: projectNameRef.current });
+    };
+
+    // Restore the open tab (legacy single draft becomes the first tab).
     draftRestoringRef.current = true;
     void (async () => {
       try {
-        const draft = await loadSketchDraft();
-        if (!draft || scopeRef.current !== scope) {
+        const index = await ensureSketchTabs(projectNameRef.current);
+        if (scopeRef.current !== scope) {
           draftRestoringRef.current = false;
           return;
         }
-        const { meta, background } = draft;
-        onStampChangeRef.current(meta.stamp);
-        if (meta.mmPerPx != null) onMmPerPxChangeRef.current(meta.mmPerPx);
-        if (background) {
-          const blobUrl = URL.createObjectURL(background);
-          if (meta.bgPlace) bgPlaceRef.current = { ...meta.bgPlace };
-          pendingDraftRestoreRef.current = {
-            items: meta.items,
-            stampOwnerId: meta.stampOwnerId,
-            mmPerPx: meta.mmPerPx,
-          };
-          onImportBgRef.current(blobUrl);
-        } else {
-          applyDraftItems(meta.items, meta.stampOwnerId);
-          draftRestoringRef.current = false;
-          onDraftSavedRef.current?.("Restored sketch from this browser");
+        publishTabs(index.tabs, index.activeId);
+        adoptHistory(index.activeId);
+        const active = index.tabs.find((t) => t.id === index.activeId);
+        if (active && active.name !== projectNameRef.current) {
+          skipNameSyncRef.current = true;
+          onProjectNameChangeRef.current(active.name);
         }
+        await loadTabIntoCanvas(index.activeId, false);
       } catch {
         draftRestoringRef.current = false;
       }
@@ -5658,6 +7235,7 @@ export function DrawCanvas({
       window.removeEventListener("mouseup", onNativeUp);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("paste", onPaste);
       window.removeEventListener("pagehide", onPageHide);
       document.removeEventListener("visibilitychange", onVisChange);
       if (draftSaveTimer != null) window.clearTimeout(draftSaveTimer);
@@ -5679,6 +7257,38 @@ export function DrawCanvas({
   useEffect(() => {
     (scopeRef.current as unknown as ScopeExtras | null)?.__setMode?.();
   }, [mode]);
+
+  useEffect(() => {
+    sketchTabsRef.current = sketchTabs;
+    activeSketchIdRef.current = activeSketchId;
+    if (skipNameSyncRef.current) {
+      skipNameSyncRef.current = false;
+      return;
+    }
+    if (!activeSketchId || sketchTabs.length === 0) return;
+    const cur = sketchTabs.find((t) => t.id === activeSketchId);
+    if (!cur || cur.name === projectName) return;
+    const next = sketchTabs.map((t) =>
+      t.id === activeSketchId ? { ...t, name: projectName } : t,
+    );
+    sketchTabsRef.current = next;
+    setSketchTabs(next);
+    onSketchTabsChangeRef.current?.(next, activeSketchId);
+    void saveSketchTabIndex({ activeId: activeSketchId, tabs: next });
+  }, [projectName, activeSketchId, sketchTabs]);
+
+  // Canvas clicks don't move focus — blur the name field so outside click = Enter.
+  useEffect(() => {
+    if (!nameEditing) return;
+    const onPointerDown = (ev: PointerEvent) => {
+      const el = nameInputRef.current;
+      if (!el) return;
+      if (ev.target instanceof Node && el.contains(ev.target)) return;
+      el.blur();
+    };
+    window.addEventListener("pointerdown", onPointerDown, true);
+    return () => window.removeEventListener("pointerdown", onPointerDown, true);
+  }, [nameEditing]);
 
   useEffect(() => {
     (scopeRef.current as unknown as ScopeExtras | null)?.__setSnapGrid?.();
@@ -5738,11 +7348,31 @@ export function DrawCanvas({
       buildPdfBytes: async () =>
         (await (scopeRef.current as unknown as ScopeExtras | null)?.__buildSketchPdfBytes?.()) ??
         null,
+      collectZipSketches: async () =>
+        (await (
+          scopeRef.current as unknown as ScopeExtras | null
+        )?.__collectZipSketches?.()) ?? [],
       saveDraft: async () => {
         (scopeRef.current as unknown as ScopeExtras | null)?.__flushDraftSave?.(
           true,
         );
       },
+      switchSketchTab: async (id: string) => {
+        await (
+          scopeRef.current as unknown as ScopeExtras | null
+        )?.__switchSketchTab?.(id);
+      },
+      requestCloseTab: async (id: string) => {
+        await (
+          scopeRef.current as unknown as ScopeExtras | null
+        )?.__requestCloseTab?.(id);
+      },
+      openFreshTab: async () => {
+        await (
+          scopeRef.current as unknown as ScopeExtras | null
+        )?.__openFreshTab?.();
+      },
+      openLibrary: () => setExamplesOpen(true),
     };
     return () => {
       saveApiRef.current = null;
@@ -5751,7 +7381,12 @@ export function DrawCanvas({
 
   useEffect(() => {
     if (!saveSketchToken) return;
-    void (scopeRef.current as unknown as ScopeExtras | null)?.__saveSketchPdf?.();
+    void (async () => {
+      const result = await (
+        scopeRef.current as unknown as ScopeExtras | null
+      )?.__saveSketchPdf?.();
+      if (result === "saved") onSketchPdfSavedRef.current?.();
+    })();
   }, [saveSketchToken]);
 
   useEffect(() => {
@@ -5843,7 +7478,7 @@ export function DrawCanvas({
   useEffect(() => {
     const scope = scopeRef.current as unknown as ScopeExtras | null;
     if (!scope || !imageDataRef.current || !traceOpen) return;
-    if (!showTraceCurves) {
+    if (!showBackground || !showTraceCurves) {
       scope.__clearImageContours?.();
       setTraceCurveCount(0);
       return;
@@ -5853,7 +7488,18 @@ export function DrawCanvas({
       if (typeof n === "number") setTraceCurveCount(n);
     }, 60);
     return () => window.clearTimeout(id);
-  }, [traceThreshold, traceSmooth, traceOpen, showTraceCurves, traceMode]);
+  }, [
+    traceThreshold,
+    traceSmooth,
+    traceOpen,
+    showBackground,
+    showTraceCurves,
+    traceMode,
+  ]);
+
+  useEffect(() => {
+    (scopeRef.current as unknown as ScopeExtras | null)?.__resampleMesh?.();
+  }, [meshQuality]);
 
   useEffect(() => {
     (scopeRef.current as unknown as ScopeExtras | null)?.__setBgVisible?.(
@@ -5928,11 +7574,10 @@ export function DrawCanvas({
       (scope as unknown as ScopeExtras).__syncStamp?.();
     } else if (meta.path.closed) {
       onClosedPathChange(
-        samplePathPoints(meta.path, {
-          flatness: 0.45,
-          minPerCurve: 16,
-          maxPoints: 400,
-        }),
+        samplePathPoints(
+          meta.path,
+          meshSampleOpts(meshQualityRef.current, "outline"),
+        ),
       );
     }
   };
@@ -5951,11 +7596,10 @@ export function DrawCanvas({
       return;
     }
     onClosedPathChange(
-      samplePathPoints(closed.path, {
-        flatness: 0.45,
-        minPerCurve: 16,
-        maxPoints: 400,
-      }),
+      samplePathPoints(
+        closed.path,
+        meshSampleOpts(meshQualityRef.current, "outline"),
+      ),
     );
   };
 
@@ -6015,11 +7659,10 @@ export function DrawCanvas({
         (scope as unknown as ScopeExtras).__syncStamp?.();
       } else {
         onClosedPathChange(
-          samplePathPoints(meta.path, {
-            flatness: 0.45,
-            minPerCurve: 16,
-            maxPoints: 400,
-          }),
+          samplePathPoints(
+            meta.path,
+            meshSampleOpts(meshQualityRef.current, "outline"),
+          ),
         );
       }
       onCurveClosed();
@@ -6048,19 +7691,40 @@ export function DrawCanvas({
       (scope as unknown as ScopeExtras).__syncStamp?.();
     } else if (meta.path.closed) {
       onClosedPathChange(
-        samplePathPoints(meta.path, {
-          flatness: 0.45,
-          minPerCurve: 16,
-          maxPoints: 400,
-        }),
+        samplePathPoints(
+          meta.path,
+          meshSampleOpts(meshQualityRef.current, "outline"),
+        ),
       );
     }
   };
 
+  const isFileDrag = (ev: DragEvent) =>
+    [...ev.dataTransfer.types].includes("Files");
+
+  const clearFileDragOver = () => {
+    fileDragDepthRef.current = 0;
+    setFileDragOver(false);
+  };
+
+  const onDragEnter = (ev: DragEvent) => {
+    if (!isFileDrag(ev)) return;
+    ev.preventDefault();
+    fileDragDepthRef.current += 1;
+    setFileDragOver(true);
+  };
+
   const onDragOver = (ev: DragEvent) => {
-    if (![...ev.dataTransfer.types].includes("Files")) return;
+    if (!isFileDrag(ev)) return;
     ev.preventDefault();
     ev.dataTransfer.dropEffect = "copy";
+    if (!fileDragOver) setFileDragOver(true);
+  };
+
+  const onDragLeave = (ev: DragEvent) => {
+    if (!isFileDrag(ev)) return;
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (fileDragDepthRef.current === 0) setFileDragOver(false);
   };
 
   const importDroppedOrPickedFile = (file: File) => {
@@ -6086,9 +7750,21 @@ export function DrawCanvas({
 
   const onDrop = (ev: DragEvent) => {
     ev.preventDefault();
+    clearFileDragOver();
     const file = pickImportableFile(ev.dataTransfer.files);
     if (file) importDroppedOrPickedFile(file);
   };
+
+  // Escape / drop outside the canvas must clear the oven overlay.
+  useEffect(() => {
+    const clear = () => clearFileDragOver();
+    window.addEventListener("dragend", clear);
+    window.addEventListener("drop", clear);
+    return () => {
+      window.removeEventListener("dragend", clear);
+      window.removeEventListener("drop", clear);
+    };
+  }, []);
 
   // Document-level so Ctrl+V works even when focus isn't on the canvas.
   useEffect(() => {
@@ -6168,11 +7844,44 @@ export function DrawCanvas({
     }
   };
 
+  const saveOpenSketchPdf = async () => {
+    if (pdfSaving) return;
+    setPdfSaving(true);
+    try {
+      const result = await (
+        scopeRef.current as unknown as ScopeExtras | null
+      )?.__saveSketchPdf?.();
+      if (result === "saved") onSketchPdfSavedRef.current?.();
+    } finally {
+      setPdfSaving(false);
+    }
+  };
+
+  const saveClosingSketchPdf = async () => {
+    const id = closeSketch?.id;
+    if (!id || pdfSaving || closePdfSaved) return;
+    const scope = scopeRef.current as unknown as ScopeExtras | null;
+    if (id !== activeSketchId) await scope?.__switchSketchTab?.(id);
+    setPdfSaving(true);
+    try {
+      const result = await scope?.__saveSketchPdf?.();
+      if (result === "saved") {
+        setClosePdfSaved(true);
+        onSketchPdfSavedRef.current?.();
+      }
+    } finally {
+      setPdfSaving(false);
+    }
+  };
+
   return (
+    <>
     <div
       ref={containerRef}
-      style={{ position: "relative", width: "100%", height: "100%" }}
+      style={{ position: "relative", width: "100%", height: "100%", minHeight: 0 }}
+      onDragEnter={onDragEnter}
       onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
       <canvas
@@ -6206,7 +7915,7 @@ export function DrawCanvas({
               stampUi === "off"
                 ? "First select a closed curve"
                 : stampUi === "back"
-                  ? "Leave stamp editing"
+                  ? "Done — leave stamp mode"
                   : stampUi === "edit"
                     ? "Edit stamp features on this cutter"
                     : "Add a stamp that fits inside this cutter"
@@ -6224,14 +7933,16 @@ export function DrawCanvas({
                   )?.__toggleStamp?.()
                 }
                 startIcon={
-                  stampUi === "back" ? undefined : (
+                  stampUi === "back" ? (
+                    <SquareCheckBig size={16} strokeWidth={2} />
+                  ) : (
                     <Stamp size={16} strokeWidth={2} />
                   )
                 }
                 sx={{ textTransform: "none", width: "100%" }}
               >
                 {stampUi === "back"
-                  ? "Edit cutter"
+                  ? "Done"
                   : stampUi === "edit"
                     ? "Edit stamp"
                     : "Add stamp"}
@@ -6262,24 +7973,33 @@ export function DrawCanvas({
             </Tooltip>
           )}
         </Box>
-        {canAddCutterAround && (
+        {stampUi !== "back" && (
           <Tooltip
-            title="Keep this curve as the stamp outline and build a cutter around it. The Bézier stays editable; the cutter follows wall thickness and fit gap."
+            title={
+              stampUi === "off"
+                ? "First select a closed curve"
+                : stampUi === "edit"
+                  ? "This curve already has a stamp — remove it first, or pick a plain outline"
+                  : "Keep this curve as the stamp outline and build a cutter around it. The Bézier stays editable; the cutter follows wall thickness and fit gap."
+            }
             placement="right"
           >
-            <Button
-              size="small"
-              variant="outlined"
-              onClick={() =>
-                (
-                  scopeRef.current as unknown as ScopeExtras | null
-                )?.__addCutterAroundOutline?.()
-              }
-              startIcon={<PawPrint size={16} strokeWidth={2} />}
-              sx={{ textTransform: "none", width: "100%" }}
-            >
-              Add cutter
-            </Button>
+            <span>
+              <Button
+                size="small"
+                variant="outlined"
+                disabled={stampUi !== "add"}
+                onClick={() =>
+                  (
+                    scopeRef.current as unknown as ScopeExtras | null
+                  )?.__addCutterAroundOutline?.()
+                }
+                startIcon={<PawPrint size={16} strokeWidth={2} />}
+                sx={{ textTransform: "none", width: "100%" }}
+              >
+                Add cutter
+              </Button>
+            </span>
           </Tooltip>
         )}
         {stampUi === "back" && (
@@ -6301,14 +8021,13 @@ export function DrawCanvas({
                 {stampGapMm.toFixed(2)} mm
               </Box>
             </Box>
-            <input
-              type="range"
+            <WheelSlider
+              size="small"
               min={0}
               max={3}
               step={0.05}
               value={stampGapMm}
-              onChange={(e) => onStampGapChange(Number(e.target.value))}
-              style={{ width: "100%" }}
+              onChange={(_, v) => onStampGapChange(v as number)}
               aria-label="Stamp fit gap"
             />
             <Box component="p" sx={{ m: 0, fontSize: 10, color: "text.secondary", lineHeight: 1.3 }}>
@@ -6350,7 +8069,7 @@ export function DrawCanvas({
             left: 8,
             bottom: 8,
             zIndex: 4,
-            width: 180,
+            width: 220,
             bgcolor: "rgba(255,255,255,0.94)",
             border: 1,
             borderColor: "divider",
@@ -6364,7 +8083,9 @@ export function DrawCanvas({
               <Box sx={{ display: "flex", gap: 0.5, mb: 0.5 }}>
                 <Button
                   size="small"
-                  variant={featureHud.raised ? "contained" : "outlined"}
+                  variant={
+                    featureHud.raised && !featureHud.hole ? "contained" : "outlined"
+                  }
                   onClick={() =>
                     (
                       scopeRef.current as unknown as ScopeExtras | null
@@ -6373,14 +8094,20 @@ export function DrawCanvas({
                   sx={{
                     textTransform: "none",
                     flex: 1,
-                    bgcolor: featureHud.raised ? "#7f1d1d" : undefined,
+                    minWidth: 0,
+                    px: 0.5,
+                    fontSize: 12,
+                    bgcolor:
+                      featureHud.raised && !featureHud.hole ? "#7f1d1d" : undefined,
                   }}
                 >
                   Raised
                 </Button>
                 <Button
                   size="small"
-                  variant={!featureHud.raised ? "contained" : "outlined"}
+                  variant={
+                    !featureHud.raised && !featureHud.hole ? "contained" : "outlined"
+                  }
                   onClick={() =>
                     (
                       scopeRef.current as unknown as ScopeExtras | null
@@ -6389,41 +8116,67 @@ export function DrawCanvas({
                   sx={{
                     textTransform: "none",
                     flex: 1,
-                    bgcolor: !featureHud.raised ? "#1e3a8a" : undefined,
+                    minWidth: 0,
+                    px: 0.5,
+                    fontSize: 12,
+                    bgcolor:
+                      !featureHud.raised && !featureHud.hole ? "#1e3a8a" : undefined,
                   }}
                 >
                   Recessed
                 </Button>
+                <Button
+                  size="small"
+                  variant={featureHud.hole ? "contained" : "outlined"}
+                  onClick={() =>
+                    (
+                      scopeRef.current as unknown as ScopeExtras | null
+                    )?.__setFeatureHole?.()
+                  }
+                  sx={{
+                    textTransform: "none",
+                    flex: 1,
+                    minWidth: 0,
+                    px: 0.5,
+                    fontSize: 12,
+                    bgcolor: featureHud.hole ? "#263238" : undefined,
+                    color: featureHud.hole ? "#fff" : undefined,
+                  }}
+                >
+                  Hole
+                </Button>
               </Box>
               {featureHud.closed && (
-                <FormControlLabel
-                  sx={{
-                    mx: 0,
-                    mb: 0.25,
-                    width: "100%",
-                    justifyContent: "space-between",
-                  }}
-                  labelPlacement="start"
-                  control={
-                    <Switch
-                      size="small"
-                      checked={featureHud.filled}
-                      onChange={() =>
-                        (
-                          scopeRef.current as unknown as ScopeExtras | null
-                        )?.__toggleFeatureFill?.()
-                      }
-                    />
-                  }
-                  label={
-                    <Box
-                      component="span"
-                      sx={{ fontSize: 11, color: "text.secondary" }}
-                    >
-                      Fill
-                    </Box>
-                  }
-                />
+                <Tooltip title="Toggle fill (F)" placement="right">
+                  <FormControlLabel
+                    sx={{
+                      mx: 0,
+                      mb: 0.25,
+                      width: "100%",
+                      justifyContent: "space-between",
+                    }}
+                    labelPlacement="start"
+                    control={
+                      <Switch
+                        size="small"
+                        checked={featureHud.filled}
+                        onChange={() =>
+                          (
+                            scopeRef.current as unknown as ScopeExtras | null
+                          )?.__toggleFeatureFill?.()
+                        }
+                      />
+                    }
+                    label={
+                      <Box
+                        component="span"
+                        sx={{ fontSize: 11, color: "text.secondary" }}
+                      >
+                        Fill
+                      </Box>
+                    }
+                  />
+                </Tooltip>
               )}
             </>
           )}
@@ -6440,27 +8193,98 @@ export function DrawCanvas({
               {featureHud.rim ? "Width" : "Line width"}
             </Box>
             <Box component="span" sx={{ fontSize: 11 }}>
-              {featureHud.widthMm.toFixed(2)} mm
+              {!featureHud.rim && featureHud.widthMm <= 0
+                ? "hairline"
+                : `${featureHud.widthMm.toFixed(2)} mm`}
             </Box>
           </Box>
           <WheelSlider
             size="small"
-            min={0.3}
+            min={featureHud.rim ? 0.3 : 0}
             max={6}
             step={0.05}
             value={featureHud.widthMm}
-            onChange={(_, v) =>
-              (scopeRef.current as unknown as ScopeExtras | null)?.__setFeatureWidth?.(
-                v as number,
-              )
-            }
+            onChange={(_, v) => {
+              const prev = featureHud.widthMm;
+              let next = v as number;
+              if (!featureHud.rim) {
+                // Discrete jump: 0 (hairline) ↔ 0.3 mm, then 0.05 steps.
+                if (prev <= 0 && next > 0) next = 0.3;
+                else if (prev >= 0.3 && next < 0.3) next = 0;
+                else if (next > 0 && next < 0.3) next = 0.3;
+              }
+              (
+                scopeRef.current as unknown as ScopeExtras | null
+              )?.__setFeatureWidth?.(next);
+            }}
             aria-label={
               featureHud.rim ? "Stamp outline width" : "Stamp line width"
             }
           />
         </Box>
       )}
-      {canvasEmpty && !backgroundUrl && (
+      {/* Project name — top center, same Y as Edit stamp / Add stamp. */}
+      {!fileDragOver && (
+        <div
+          style={{
+            position: "absolute",
+            left: "50%",
+            top: 8,
+            transform: "translateX(-50%)",
+            zIndex: 3,
+            pointerEvents: "none",
+            width: "min(52%, 420px)",
+            height: 30.75,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <input
+            ref={nameInputRef}
+            value={projectName}
+            aria-label="Cookie name"
+            spellCheck={false}
+            onChange={(ev) => onProjectNameChange(ev.target.value)}
+            onFocus={() => setNameEditing(true)}
+            onBlur={() => {
+              setNameEditing(false);
+              const next = projectDisplayName(projectName);
+              if (next !== projectName) onProjectNameChange(next);
+            }}
+            onKeyDown={(ev) => {
+              if (ev.key === "Enter") {
+                ev.preventDefault();
+                (ev.target as HTMLInputElement).blur();
+              } else if (ev.key === "Escape") {
+                ev.preventDefault();
+                (ev.target as HTMLInputElement).blur();
+              }
+              ev.stopPropagation();
+            }}
+            onPointerDown={(ev) => ev.stopPropagation()}
+            style={{
+              pointerEvents: "auto",
+              width: "100%",
+              height: "100%",
+              border: "none",
+              outline: nameEditing ? "1px dashed #b0b7be" : "none",
+              outlineOffset: 4,
+              background: "transparent",
+              textAlign: "center",
+              fontSize: 18,
+              fontWeight: 600,
+              letterSpacing: 0.2,
+              color: "#b0b7be",
+              caretColor: "#78909c",
+              padding: "0 8px",
+              borderRadius: 4,
+              cursor: nameEditing ? "text" : "pointer",
+            }}
+          />
+        </div>
+      )}
+      {(fileDragOver || (canvasEmpty && !backgroundUrl)) && (
         <div
           style={{
             position: "absolute",
@@ -6469,40 +8293,57 @@ export function DrawCanvas({
             flexDirection: "column",
             alignItems: "center",
             justifyContent: "center",
-            gap: 12,
+            gap: fileDragOver ? 16 : 12,
             pointerEvents: "none",
             color: "#9aa0a6",
-            fontSize: 15,
+            fontSize: fileDragOver ? 22 : 15,
+            fontWeight: fileDragOver ? 700 : undefined,
             letterSpacing: 0.2,
             userSelect: "none",
+            background: fileDragOver ? "rgba(255,255,255,0.72)" : undefined,
+            zIndex: fileDragOver ? 6 : undefined,
           }}
         >
-          Drop or paste image, SVG or PDF — or start drawing
-          <Button
-            size="small"
-            variant="outlined"
-            onClick={() => setExamplesOpen(true)}
-            sx={{
-              pointerEvents: "auto",
-              textTransform: "none",
-              color: "#546e7a",
-              borderColor: "#cfd8dc",
-              bgcolor: "rgba(255,255,255,0.9)",
-              "&:hover": {
-                borderColor: "#c45c26",
-                color: "#c45c26",
-                bgcolor: "#fff",
-              },
-            }}
-          >
-            Load example
-          </Button>
+          {fileDragOver ? (
+            <>
+              Drop your cookie into oven!
+              <Microwave size={48} strokeWidth={2.25} aria-hidden />
+            </>
+          ) : (
+            "Drop or paste image, SVG or PDF — or start drawing"
+          )}
+          {!fileDragOver && (
+            <Button
+              size="small"
+              variant="outlined"
+              onClick={() => setExamplesOpen(true)}
+              startIcon={<Library size={16} strokeWidth={2} />}
+              sx={{
+                pointerEvents: "auto",
+                textTransform: "none",
+                color: "#546e7a",
+                borderColor: "#cfd8dc",
+                bgcolor: "rgba(255,255,255,0.9)",
+                "&:hover": {
+                  borderColor: "#c45c26",
+                  color: "#c45c26",
+                  bgcolor: "#fff",
+                },
+              }}
+            >
+              Browse library
+            </Button>
+          )}
         </div>
       )}
       <ExamplesDialog
         open={examplesOpen}
         onClose={() => setExamplesOpen(false)}
-        onPick={importDroppedOrPickedFile}
+        onPick={(file: File, ex: SketchExample) => {
+          void (
+            scopeRef.current as unknown as ScopeExtras | null
+          )?.__importVectorFile?.(file, { preferredName: ex.title });
+        }}
       />
       {mode === "measure" && measureReadout && !measureEdit && (
         <div
@@ -6529,11 +8370,13 @@ export function DrawCanvas({
       )}
       <Tooltip
         title={
-          hasClosedCurve
-            ? "Download sketch PDF (Ctrl+S saves a browser draft)"
-            : hasCurves
+          pdfSaving
+            ? "Preparing PDF…"
+            : hasClosedCurve
               ? "Download sketch PDF (Ctrl+S saves a browser draft)"
-              : "Draw a curve to save — autosaves in this browser"
+              : hasCurves
+                ? "Download sketch PDF (Ctrl+S saves a browser draft)"
+                : "Draw a curve to save — autosaves in this browser"
         }
         placement="left"
       >
@@ -6547,10 +8390,10 @@ export function DrawCanvas({
         >
           <IconButton
             size="small"
-            disabled={!hasCurves}
-            onClick={() =>
-              (scopeRef.current as unknown as ScopeExtras | null)?.__saveSketchPdf?.()
-            }
+            disabled={!hasCurves || pdfSaving}
+            onClick={() => {
+              void saveOpenSketchPdf();
+            }}
             sx={{
               bgcolor: hasClosedCurve ? "#c45c26" : "background.paper",
               color: hasClosedCurve ? "#fff" : "action.active",
@@ -6561,13 +8404,19 @@ export function DrawCanvas({
                 bgcolor: hasClosedCurve ? "#a84a1c" : "grey.100",
               },
               "&.Mui-disabled": {
-                bgcolor: "background.paper",
-                borderColor: "divider",
+                bgcolor: hasClosedCurve && pdfSaving ? "#c45c26" : "background.paper",
+                color: hasClosedCurve && pdfSaving ? "#fff" : undefined,
+                borderColor: hasClosedCurve && pdfSaving ? "#c45c26" : "divider",
+                opacity: pdfSaving ? 1 : undefined,
               },
             }}
-            aria-label="Save sketch as PDF"
+            aria-label={pdfSaving ? "Preparing PDF" : "Save sketch as PDF"}
           >
-            <SaveAltIcon fontSize="small" />
+            {pdfSaving ? (
+              <CircularProgress size={18} thickness={5} color="inherit" />
+            ) : (
+              <SaveAltIcon fontSize="small" />
+            )}
           </IconButton>
         </span>
       </Tooltip>
@@ -6694,7 +8543,7 @@ export function DrawCanvas({
           <>
             <MenuItem
               onClick={() => {
-                const raised = ctxMenu.meta.raised === false;
+                const raised = ctxMenu.meta.hole || ctxMenu.meta.raised === false;
                 closeMenu();
                 (scopeRef.current as unknown as ScopeExtras | null)?.__setFeatureRaised?.(
                   raised,
@@ -6702,9 +8551,23 @@ export function DrawCanvas({
               }}
             >
               <ListItemText
-                primary={ctxMenu.meta.raised === false ? "Make raised" : "Make recessed"}
+                primary={
+                  ctxMenu.meta.hole || ctxMenu.meta.raised === false
+                    ? "Make raised"
+                    : "Make recessed"
+                }
               />
             </MenuItem>
+            {!ctxMenu.meta.hole && (
+              <MenuItem
+                onClick={() => {
+                  closeMenu();
+                  (scopeRef.current as unknown as ScopeExtras | null)?.__setFeatureHole?.();
+                }}
+              >
+                <ListItemText primary="Make hole" />
+              </MenuItem>
+            )}
             {ctxMenu.meta.path.closed && (
               <MenuItem
                 onClick={() => {
@@ -6927,5 +8790,117 @@ export function DrawCanvas({
         )}
       </Menu>
     </div>
+    <Dialog
+      open={!!closeSketch}
+      onClose={() => {
+        setCloseSketch(null);
+        setClosePdfSaved(false);
+        setCloseDontAsk(false);
+      }}
+      maxWidth="xs"
+      fullWidth
+    >
+      <DialogContent sx={{ pt: 2.5, pb: 1 }}>
+        <Box sx={{ fontSize: 16, fontWeight: 600 }}>
+          Delete “{closeSketch?.name}”?
+        </Box>
+        <Divider sx={{ my: 1.5 }} />
+        <Box sx={{ fontSize: 13, color: "text.secondary", lineHeight: 1.45 }}>
+          Save the sketch as PDF if you want to edit it later.
+        </Box>
+      </DialogContent>
+      <DialogActions
+        sx={{
+          px: 2,
+          pb: 1.5,
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: 1,
+        }}
+      >
+        <Button
+          variant={closePdfSaved ? "outlined" : "contained"}
+          disabled={pdfSaving}
+          onClick={() => {
+            void saveClosingSketchPdf();
+          }}
+          startIcon={
+            pdfSaving ? (
+              <CircularProgress size={18} thickness={5} color="inherit" />
+            ) : closePdfSaved ? (
+              <SquareCheckBig size={18} strokeWidth={2} />
+            ) : (
+              <SaveAltIcon fontSize="small" />
+            )
+          }
+          sx={{ textTransform: "none", height: 36.5 }}
+        >
+          {pdfSaving
+            ? "Preparing PDF…"
+            : closePdfSaved
+              ? "Sketch PDF saved"
+              : "Save sketch PDF"}
+        </Button>
+        <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+          <Button
+            onClick={() => {
+              setCloseSketch(null);
+              setClosePdfSaved(false);
+              setCloseDontAsk(false);
+            }}
+            sx={{ textTransform: "none", height: 36.5 }}
+          >
+            Cancel
+          </Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={() => {
+              const id = closeSketch?.id;
+              if (closeDontAsk) saveCloseTabConfirmHidden(true);
+              setCloseSketch(null);
+              setClosePdfSaved(false);
+              setCloseDontAsk(false);
+              if (!id) return;
+              void (
+                scopeRef.current as unknown as ScopeExtras | null
+              )?.__confirmCloseTab?.(id);
+            }}
+            sx={{ textTransform: "none", height: 36.5 }}
+          >
+            Delete
+          </Button>
+        </Box>
+      </DialogActions>
+      <Box
+        sx={{
+          px: 2,
+          py: 1.25,
+          borderTop: 1,
+          borderColor: "divider",
+          bgcolor: "action.hover",
+        }}
+      >
+        <FormControlLabel
+          sx={{ mx: 0, alignItems: "center" }}
+          control={
+            <Checkbox
+              size="small"
+              checked={closeDontAsk}
+              onChange={(_, v) => setCloseDontAsk(v)}
+            />
+          }
+          label={
+            <Box
+              component="span"
+              sx={{ fontSize: 12, color: "text.disabled", lineHeight: 1.35 }}
+            >
+              Do not show this message again
+            </Box>
+          }
+        />
+      </Box>
+    </Dialog>
+    </>
   );
 }

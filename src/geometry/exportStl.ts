@@ -314,9 +314,16 @@ export async function downloadAssemblyStl(
   group: THREE.Group,
   filename = "pernicek-cutter-stamp.stl",
 ): Promise<SaveResult | false> {
-  const bytes = await assemblyStlBytes(group);
+  const bytes = await cutterStampStlBytes(group);
   if (!bytes) return false;
   return saveBlob(new Blob([bytes], { type: "model/stl" }), filename);
+}
+
+/** Nested cutter + stamp in one binary STL, or null if either part is missing. */
+export async function cutterStampStlBytes(
+  group: THREE.Group,
+): Promise<Uint8Array | null> {
+  return assemblyStlBytes(group);
 }
 
 async function assemblyStlBytes(group: THREE.Group): Promise<Uint8Array | null> {
@@ -382,19 +389,25 @@ export async function downloadProjectZip(
   group: THREE.Group,
   extras: { name: string; data: Uint8Array }[] = [],
   zipName = "pernicek.zip",
+  /** Basename used for STL entries inside the ZIP (defaults from zipName). */
+  fileBase?: string,
 ): Promise<SaveResult | false> {
+  const base =
+    (fileBase && fileBase.trim()) ||
+    zipName.replace(/\.zip$/i, "").trim() ||
+    "pernicek";
   const { cutter, stamp } = partGroups(group);
   const files: { name: string; data: Uint8Array }[] = [...extras];
   if (cutter) {
     files.push({
-      name: "pernicek-cutter.stl",
+      name: `${base}-cutter.stl`,
       data: await stlBytesForPart(cutter, "cutter"),
     });
     await yieldToMain();
   }
   if (stamp) {
     files.push({
-      name: "pernicek-stamp.stl",
+      name: `${base}-stamp.stl`,
       data: await stlBytesForPart(stamp, "stamp"),
     });
     await yieldToMain();
@@ -402,17 +415,27 @@ export async function downloadProjectZip(
   if (cutter && stamp) {
     const assembly = await assemblyStlBytes(group);
     if (assembly) {
-      files.push({ name: "pernicek-cutter-stamp.stl", data: assembly });
+      files.push({ name: `${base}-cutter-stamp.stl`, data: assembly });
     }
   }
   try {
     files.push({
-      name: HOLDER_STL_NAME,
+      name: `${base}-holder.stl`,
       data: await fetchHolderStlBytes(),
     });
   } catch {
     // Keep the rest of the ZIP if the static holder asset is missing.
   }
+  if (!files.length) return false;
+  await yieldToMain();
+  return saveBlob(zipStore(files), zipName);
+}
+
+/** Save an already-built file list as one ZIP. */
+export async function downloadFilesZip(
+  files: { name: string; data: Uint8Array }[],
+  zipName = "pernicek.zip",
+): Promise<SaveResult | false> {
   if (!files.length) return false;
   await yieldToMain();
   return saveBlob(zipStore(files), zipName);

@@ -21,6 +21,26 @@ function fmt(n: number): string {
   return String(v);
 }
 
+/**
+ * PDF text string (Info dict): UTF-16BE with BOM as a hex string,
+ * so titles can keep accents and other non-Latin1 characters.
+ */
+export function pdfInfoText(value: string): string {
+  const units: number[] = [0xfe, 0xff];
+  for (const ch of value) {
+    const cp = ch.codePointAt(0)!;
+    if (cp > 0xffff) {
+      const v = cp - 0x10000;
+      const hi = 0xd800 + (v >> 10);
+      const lo = 0xdc00 + (v & 0x3ff);
+      units.push((hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff);
+    } else {
+      units.push((cp >> 8) & 0xff, cp & 0xff);
+    }
+  }
+  return `<${units.map((b) => b.toString(16).padStart(2, "0")).join("")}>`;
+}
+
 function ringOps(
   segs: ImportedSeg[],
   closed: boolean,
@@ -140,6 +160,8 @@ export type SketchPdfOptions = {
   stampOutlineEnabled?: boolean | null;
   /** Raised outline rim width (mm) for round-trip. */
   stampOutlineWidthMm?: number | null;
+  /** Project / cookie title stored as PDF `/Title` (Unicode-safe). */
+  projectName?: string | null;
 };
 
 /** Encode a raster URL / data-URL as JPEG for PDF embedding. */
@@ -331,11 +353,15 @@ export function buildSketchPdf(
   push("\nendstream\n");
   endObj();
 
-  // TrueScale + optional BgRect for round-trip placement.
+  // TrueScale + optional BgRect / Title for round-trip.
   startObj(infoObj);
   let info =
     `<< /Producer (${PDF_PRODUCER}) /Creator (${PDF_PRODUCER}) ` +
     `/TrueScale true /MmPerPx ${fmt(mmPerPx)}`;
+  const title = options.projectName?.trim();
+  if (title) {
+    info += ` /Title ${pdfInfoText(title)}`;
+  }
   if (bgRectContent) {
     info +=
       ` /BgRect [${fmt(bgRectContent.x)} ${fmt(bgRectContent.y)} ` +

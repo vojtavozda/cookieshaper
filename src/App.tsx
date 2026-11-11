@@ -6,7 +6,15 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Alert, Box, Button, Snackbar, SvgIcon, Typography } from "@mui/material";
+import {
+  Alert,
+  Box,
+  Button,
+  Snackbar,
+  SvgIcon,
+  Tooltip,
+  Typography,
+} from "@mui/material";
 import type { SvgIconProps } from "@mui/material/SvgIcon";
 import * as THREE from "three";
 import { DrawCanvas, type CanvasSaveApi } from "./components/DrawCanvas";
@@ -16,15 +24,24 @@ import { Viewer3D } from "./components/Viewer3D";
 import { CrossSection } from "./components/CrossSection";
 import { SplitPane } from "./components/SplitPane";
 import {
+  SketchTabsBar,
+  SKETCH_TAB_BG,
+  SKETCH_TAB_FG,
+} from "./components/SketchTabsBar";
+import {
+  CoffeeFollowUpDialog,
   DownloadDialog,
   type DownloadChoice,
 } from "./components/DownloadDialog";
+import type { SketchTab } from "./geometry/sketchDraft";
 import { buildCutter } from "./geometry/buildCutter";
 import {
+  cutterStampStlBytes,
   downloadAssemblyStl,
   downloadCutterStl,
+  downloadFilesZip,
   downloadHolderStl,
-  downloadProjectZip,
+  fetchHolderStlBytes,
   downloadStampStl,
 } from "./geometry/exportStl";
 import { bboxSize } from "./geometry/offset";
@@ -41,17 +58,45 @@ import {
 } from "./types";
 import {
   loadBuildMethod,
+  loadCoffeeFollowUpHidden,
   loadMmPerPx,
   loadParams,
+  loadProjectName,
+  loadSketchTabsBarVisible,
   loadSnapGrid,
   loadSplitLayout,
+  loadWallProfileMode,
   saveBuildMethod,
   saveMmPerPx,
   saveParams,
+  saveProjectName,
+  saveSketchTabsBarVisible,
   saveSnapGrid,
   saveSplitLayout,
+  saveWallProfileMode,
 } from "./storage";
-import { buildStamp } from "./geometry/buildStamp";
+import { buildCookie, buildStamp } from "./geometry/buildStamp";
+import { projectExportNames, uniqueFileBase } from "./projectName";
+import { ChevronDown, Coffee, SaveCheck, Star, Upload } from "lucide-react";
+
+const BMC_HREF = "https://www.buymeacoffee.com/vojtavozda";
+const BMC_SHOW_CLASS = "bmc-show-widget";
+
+/** Open the Buy Me a Coffee iframe widget (script in index.html), not a new tab. */
+function openBuyMeACoffeeWidget() {
+  const btn = document.getElementById("bmc-wbtn");
+  if (!(btn instanceof HTMLElement)) {
+    window.open(BMC_HREF, "_blank", "noopener,noreferrer");
+    return;
+  }
+  // Floater is CSS-hidden until this class is set; click opens the BMC overlay.
+  document.body.classList.add(BMC_SHOW_CLASS);
+  btn.click();
+  // Hide the floating button again; the overlay stays open on its own.
+  requestAnimationFrame(() => {
+    document.body.classList.remove(BMC_SHOW_CLASS);
+  });
+}
 
 /** Lucide no longer ships brand marks — classic GitHub glyph. */
 function GithubIcon(props: SvgIconProps) {
@@ -89,6 +134,58 @@ function Kbd({ children }: { children: ReactNode }) {
   );
 }
 
+function exportSizeMm(
+  pts: Vec2[],
+  mmPerPx: number | null,
+  fallback: number,
+): number {
+  if (mmPerPx == null || mmPerPx <= 0) return fallback;
+  const { width, height } = bboxSize(pts);
+  const longPx = Math.max(width, height);
+  if (longPx <= 1e-9) return fallback;
+  return Math.min(300, Math.max(10, Math.round(longPx * mmPerPx * 10) / 10));
+}
+
+function buildDownloadRoot(
+  pts: Vec2[],
+  p: CutterParams,
+  method: BuildMethod,
+  features: StampFeatureIn[],
+  sp: StampParams,
+  outlinePx: Vec2[] | null,
+): THREE.Group {
+  const { group } = buildCutter(pts, p, method);
+  group.userData.part = "cutter";
+  group.traverse((o) => {
+    o.userData.part = "cutter";
+  });
+  const root = new THREE.Group();
+  root.add(group);
+  root.add(
+    buildStamp({
+      cutterPx: pts,
+      sizeMm: p.sizeMm,
+      wallMm: p.wallThicknessMm,
+      gapMm: sp.gapMm,
+      plateMm: sp.plateMm,
+      raiseMm: sp.raiseMm,
+      recessMm: sp.recessMm,
+      features,
+      outlineEnabled: sp.outlineEnabled,
+      outlineWidthMm: sp.outlineWidthMm,
+      outlinePx,
+    }),
+  );
+  return root;
+}
+
+function disposeObject3D(root: THREE.Object3D) {
+  root.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    mesh.geometry?.dispose();
+  });
+}
+
 function hintParts(...parts: ReactNode[]) {
   return parts.reduce<ReactNode[]>((acc, part, i) => {
     if (i > 0) acc.push(" · ");
@@ -98,6 +195,7 @@ function hintParts(...parts: ReactNode[]) {
 }
 
 export default function App() {
+  const [stars, setStars] = useState<number | null>(null);
   const [params, setParams] = useState<CutterParams>(() => loadParams());
   const [liveUpdate, setLiveUpdate] = useState(true);
   const [path, setPath] = useState<Vec2[] | null>(null);
@@ -126,7 +224,9 @@ export default function App() {
   const [lastDrawMode, setLastDrawMode] = useState<
     "draw" | "polygon" | "ellipse"
   >("draw");
-  const [wallProfileMode, setWallProfileMode] = useState<WallProfileMode>("large");
+  const [wallProfileMode, setWallProfileMode] = useState<WallProfileMode>(() =>
+    loadWallProfileMode("hidden"),
+  );
   const [presetRevert, setPresetRevert] = useState<{
     params: CutterParams;
     stamp: StampParams;
@@ -141,6 +241,15 @@ export default function App() {
   const saveApiRef = useRef<CanvasSaveApi | null>(null);
   const [hasCurves, setHasCurves] = useState(false);
   const [downloadOpen, setDownloadOpen] = useState(false);
+  const [coffeeFollowUp, setCoffeeFollowUp] = useState(false);
+  const [projectName, setProjectName] = useState(() => loadProjectName());
+  const projectNameRef = useRef(projectName);
+  projectNameRef.current = projectName;
+  const [sketchTabs, setSketchTabs] = useState<SketchTab[]>([]);
+  const [activeSketchId, setActiveSketchId] = useState<string | null>(null);
+  const [tabsBarVisible, setTabsBarVisible] = useState(() =>
+    loadSketchTabsBarVisible(),
+  );
 
   const hasClosedPath = !!path && path.length >= 3;
   const pathLongPx = useMemo(() => {
@@ -182,22 +291,26 @@ export default function App() {
         });
         const root = new THREE.Group();
         root.add(group);
-        if (features) {
-          const stampGroup = buildStamp({
-            cutterPx: pts,
-            sizeMm: p.sizeMm,
-            wallMm: p.wallThicknessMm,
-            gapMm: sp.gapMm,
-            plateMm: sp.plateMm,
-            raiseMm: sp.raiseMm,
-            recessMm: sp.recessMm,
-            features,
-            outlineEnabled: sp.outlineEnabled,
-            outlineWidthMm: sp.outlineWidthMm,
-            outlinePx,
-          });
-          root.add(stampGroup);
-        }
+        const stampArgs = {
+          cutterPx: pts,
+          sizeMm: p.sizeMm,
+          wallMm: p.wallThicknessMm,
+          gapMm: sp.gapMm,
+          plateMm: sp.plateMm,
+          raiseMm: sp.raiseMm,
+          recessMm: sp.recessMm,
+          features: features ?? [],
+          outlineEnabled: sp.outlineEnabled,
+          outlineWidthMm: sp.outlineWidthMm,
+          outlinePx,
+        };
+        if (features) root.add(buildStamp(stampArgs));
+        const cookie = buildCookie(stampArgs);
+        cookie.visible = false;
+        cookie.traverse((o) => {
+          o.userData.part = "cookie";
+        });
+        root.add(cookie);
         meshRef.current = root;
         setMeshGroup(root);
         setSizeReadout({ widthMm, heightMm });
@@ -235,6 +348,15 @@ export default function App() {
   }, [params]);
 
   useEffect(() => {
+    fetch("https://api.github.com/repos/vojtavozda/cookieshaper")
+      .then((res) => res.json())
+      .then((data: { stargazers_count?: number }) => {
+        if (typeof data.stargazers_count === "number") setStars(data.stargazers_count);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     saveBuildMethod(buildMethod);
   }, [buildMethod]);
 
@@ -243,8 +365,16 @@ export default function App() {
   }, [snapGrid]);
 
   useEffect(() => {
+    saveWallProfileMode(wallProfileMode);
+  }, [wallProfileMode]);
+
+  useEffect(() => {
     if (mmPerPx != null && mmPerPx > 0) saveMmPerPx(mmPerPx);
   }, [mmPerPx]);
+
+  useEffect(() => {
+    saveProjectName(projectName);
+  }, [projectName]);
 
   // Keep Size in sync with the calibrated scale when the outline changes
   useEffect(() => {
@@ -294,40 +424,91 @@ export default function App() {
   const canStamp = !!(meshGroup && stampFeatures);
   const canCutter = !!meshGroup;
 
-  const handleDownloadChoice = useCallback(async (choice: DownloadChoice) => {
+  const handleDownloadChoice = useCallback(
+    async (
+      choice: DownloadChoice,
+      onProgress?: (done: number, total: number) => void,
+    ) => {
     const mesh = meshRef.current;
+    const names = projectExportNames(projectNameRef.current);
     if (choice === "sketch") {
       const result = await saveApiRef.current?.savePdf();
       return result === "saved";
     }
     if (choice === "cutter") {
-      const result = mesh ? await downloadCutterStl(mesh) : false;
+      const result = mesh ? await downloadCutterStl(mesh, names.cutter) : false;
       if (!result) throw new Error("No cutter mesh to export");
       return result === "saved";
     }
     if (choice === "stamp") {
-      const result = mesh ? await downloadStampStl(mesh) : false;
+      const result = mesh ? await downloadStampStl(mesh, names.stamp) : false;
       if (!result) throw new Error("No stamp mesh to export");
       return result === "saved";
     }
     if (choice === "assembly") {
-      const result = mesh ? await downloadAssemblyStl(mesh) : false;
+      const result = mesh
+        ? await downloadAssemblyStl(mesh, names.assembly)
+        : false;
       if (!result) throw new Error("Need both a cutter and a stamp");
       return result === "saved";
     }
     if (choice === "holder") {
-      const result = await downloadHolderStl();
+      const result = await downloadHolderStl(names.holder);
       if (!result) throw new Error("Could not download stamp holder");
       return result === "saved";
     }
-    const extras: { name: string; data: Uint8Array }[] = [];
-    const pdf = await saveApiRef.current?.buildPdfBytes();
-    if (pdf) extras.push({ name: "pernicek.pdf", data: pdf });
-    const root = mesh ?? new THREE.Group();
-    const result = await downloadProjectZip(root, extras);
+    const sketches = (await saveApiRef.current?.collectZipSketches()) ?? [];
+    const files: { name: string; data: Uint8Array }[] = [];
+    const used = new Set<string>();
+    const total = sketches.length;
+    const paint = () =>
+      new Promise<void>((r) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => r())),
+      );
+    for (let i = 0; i < sketches.length; i++) {
+      const sk = sketches[i];
+      onProgress?.(i, total);
+      await paint();
+      const base = uniqueFileBase(sk.name, used);
+      if (sk.pdf) files.push({ name: `${base}.pdf`, data: sk.pdf });
+      if (!sk.pts || sk.pts.length < 3 || !sk.features) {
+        onProgress?.(i + 1, total);
+        continue;
+      }
+      try {
+        const root = buildDownloadRoot(
+          sk.pts,
+          { ...params, sizeMm: exportSizeMm(sk.pts, sk.mmPerPx, params.sizeMm) },
+          buildMethod,
+          sk.features,
+          sk.stamp,
+          sk.outlinePx,
+        );
+        const stl = await cutterStampStlBytes(root);
+        disposeObject3D(root);
+        if (stl) files.push({ name: `${base}-cutter-stamp.stl`, data: stl });
+      } catch {
+        /* This tab stays in the ZIP as a sketch only. */
+      }
+      onProgress?.(i + 1, total);
+    }
+    if (!files.length) throw new Error("Nothing to put in the ZIP");
+    try {
+      files.push({
+        name: "stamp-holder.stl",
+        data: await fetchHolderStlBytes(),
+      });
+    } catch {
+      /* Keep the sketches if the static holder asset is missing. */
+    }
+    const zipName =
+      sketches.length > 1 ? "pernickovadla.zip" : names.zip;
+    const result = await downloadFilesZip(files, zipName);
     if (!result) throw new Error("Nothing to put in the ZIP");
     return result === "saved";
-  }, []);
+  },
+  [params, buildMethod],
+  );
 
   const sketchHint = useMemo(() => {
     const ctrlZ = (
@@ -444,38 +625,164 @@ export default function App() {
           bgcolor: "primary.main",
           color: "primary.contrastText",
           display: "flex",
-          alignItems: "center",
+          alignItems: "stretch",
           justifyContent: "space-between",
           gap: 1,
         }}
       >
-        <Box component="span" sx={{ fontWeight: 700, letterSpacing: 0.3 }}>
-          Perníčkovadlo — Cookie shaper
-        </Box>
-        <Button
-          component="a"
-          href="https://github.com/vojtavozda/cookieshaper"
-          target="_blank"
-          rel="noopener noreferrer"
-          size="small"
-          startIcon={<GithubIcon sx={{ fontSize: 16 }} />}
+        <Box
           sx={{
-            textTransform: "none",
-            color: "primary.contrastText",
-            borderColor: "rgba(255,255,255,0.55)",
-            px: 1.25,
-            py: 0.15,
-            minHeight: 0,
-            "&:hover": {
-              borderColor: "primary.contrastText",
-              bgcolor: "rgba(255,255,255,0.12)",
-            },
+            display: "flex",
+            alignItems: "stretch",
+            gap: 1,
+            minWidth: 0,
+            alignSelf: "stretch",
           }}
-          variant="outlined"
         >
-          GitHub
-        </Button>
+          {!tabsBarVisible && (
+            <Tooltip title="Show tabs">
+              <Button
+                size="small"
+                aria-label="Show tabs"
+                onClick={() => {
+                  setTabsBarVisible(true);
+                  saveSketchTabsBarVisible(true);
+                }}
+                sx={{
+                  textTransform: "none",
+                  color: SKETCH_TAB_FG,
+                  minWidth: 0,
+                  px: 0.85,
+                  py: 0.15,
+                  minHeight: 0,
+                  alignSelf: "stretch",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  border: "none",
+                  bgcolor: SKETCH_TAB_BG ?? "transparent",
+                  "&:hover": {
+                    bgcolor: "rgba(0,0,0,0.28)",
+                    color: "#fff8f3",
+                  },
+                }}
+              >
+                <ChevronDown size={16} strokeWidth={2} />
+              </Button>
+            </Tooltip>
+          )}
+          <Box
+            component="span"
+            sx={{
+              fontWeight: 700,
+              letterSpacing: 0.3,
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Perníčkovadlo — Cookie shaper
+          </Box>
+        </Box>
+        <Box sx={{ display: "flex", alignItems: "stretch", gap: 0.75 }}>
+          <Button
+            component="a"
+            href="https://github.com/vojtavozda/cookieshaper"
+            target="_blank"
+            rel="noopener noreferrer"
+            size="small"
+            startIcon={<GithubIcon sx={{ fontSize: 16 }} />}
+            sx={{
+              textTransform: "none",
+              color: "primary.contrastText",
+              borderColor: "rgba(255,255,255,0.55)",
+              px: 1.25,
+              py: 0.15,
+              minHeight: 0,
+              "&:hover": {
+                borderColor: "#111",
+                bgcolor: "#111",
+                color: "#fff",
+              },
+            }}
+            variant="outlined"
+          >
+            GitHub
+            {stars != null && (
+              <>
+                <Box
+                  component="span"
+                  aria-hidden
+                  sx={{
+                    width: "1px",
+                    height: 14,
+                    mx: 0.85,
+                    bgcolor: "currentColor",
+                    opacity: 0.55,
+                  }}
+                />
+                <Star size={14} strokeWidth={2} />
+                <Box
+                  component="span"
+                  sx={{ ml: 0.4, fontVariantNumeric: "tabular-nums" }}
+                >
+                  {stars}
+                </Box>
+              </>
+            )}
+          </Button>
+          <Tooltip title="Hate ads? Support this project and buy me a coffee!" enterDelay={300}>
+            <Button
+              size="small"
+              aria-label="Hate ads? Support this project and buy me a coffee!"
+              onClick={openBuyMeACoffeeWidget}
+              sx={{
+                textTransform: "none",
+                color: "primary.contrastText",
+                borderColor: "rgba(255,255,255,0.55)",
+                minWidth: 0,
+                px: 0.85,
+                py: 0.15,
+                minHeight: 0,
+                alignSelf: "stretch",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                "&:hover": {
+                  borderColor: "#FFDD00",
+                  bgcolor: "#FFDD00",
+                  color: "#000",
+                },
+              }}
+              variant="outlined"
+            >
+              <Coffee size={16} strokeWidth={2} />
+            </Button>
+          </Tooltip>
+        </Box>
       </Box>
+
+      {tabsBarVisible && (
+        <SketchTabsBar
+          tabs={sketchTabs}
+          activeId={activeSketchId}
+          onSelect={(id) => {
+            void saveApiRef.current?.switchSketchTab(id);
+          }}
+          onCloseTab={(id) => {
+            void saveApiRef.current?.requestCloseTab(id);
+          }}
+          onNewTab={() => {
+            void saveApiRef.current?.openFreshTab();
+          }}
+          onOpenLibrary={() => {
+            saveApiRef.current?.openLibrary();
+          }}
+          onHide={() => {
+            setTabsBarVisible(false);
+            saveSketchTabsBarVisible(false);
+          }}
+        />
+      )}
 
       <Box sx={{ display: "flex", flex: 1, minHeight: 0 }}>
         <ToolRail
@@ -546,6 +853,16 @@ export default function App() {
                   stamp={stamp}
                   onStampChange={setStamp}
                   onDraftSaved={setToast}
+                  onSketchPdfSaved={() => {
+                    if (!loadCoffeeFollowUpHidden()) setCoffeeFollowUp(true);
+                  }}
+                  projectName={projectName}
+                  onProjectNameChange={setProjectName}
+                  onSketchTabsChange={(tabs, activeId) => {
+                    setSketchTabs(tabs);
+                    setActiveSketchId(activeId);
+                  }}
+                  meshQuality={params.meshQuality}
                   onStampFeatures={(features, outline) => {
                     setStampFeatures(features);
                     setStampOutlinePx(
@@ -618,36 +935,16 @@ export default function App() {
           right={
             <Box sx={{ flex: 1, minWidth: 0, minHeight: 0, position: "relative" }}>
               {hasClosedPath ? (
-                <>
-                  <Viewer3D
-                    group={meshGroup}
-                    liveUpdate={liveUpdate}
-                    needsApply={needsApply}
-                    onLiveUpdateChange={setLiveUpdate}
-                    onApply={() =>
-                      path &&
-                        rebuild(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx)
-                    }
-                  />
-                  {wallProfileMode !== "hidden" && (
-                    <Box
-                      sx={{
-                        position: "absolute",
-                        top: 8,
-                        right: 8,
-                        left: 52,
-                        zIndex: 3,
-                        maxHeight: "calc(100% - 16px)",
-                      }}
-                    >
-                      <CrossSection
-                        params={params}
-                        stamp={stampFeatures ? stamp : null}
-                        onHide={() => setWallProfileMode("hidden")}
-                      />
-                    </Box>
-                  )}
-                </>
+                <Viewer3D
+                  group={meshGroup}
+                  liveUpdate={liveUpdate}
+                  needsApply={needsApply}
+                  onLiveUpdateChange={setLiveUpdate}
+                  onApply={() =>
+                    path &&
+                      rebuild(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx)
+                  }
+                />
               ) : (
                 <Box
                   sx={{
@@ -668,6 +965,24 @@ export default function App() {
                   </Typography>
                 </Box>
               )}
+              {wallProfileMode !== "hidden" && (
+                <Box
+                  sx={{
+                    position: "absolute",
+                    top: 8,
+                    right: 8,
+                    zIndex: 3,
+                    maxWidth: "calc(100% - 60px)",
+                    maxHeight: "calc(100% - 16px)",
+                  }}
+                >
+                  <CrossSection
+                    params={params}
+                    stamp={stampFeatures ? stamp : null}
+                    onHide={() => setWallProfileMode("hidden")}
+                  />
+                </Box>
+              )}
             </Box>
           }
         />
@@ -675,7 +990,7 @@ export default function App() {
         <ParamsPanel
           params={params}
           sizeReadout={sizeReadout}
-          enabled={hasClosedPath}
+          enabled
           wallProfileMode={wallProfileMode}
           method={buildMethod}
           onMethodChange={setBuildMethod}
@@ -695,8 +1010,18 @@ export default function App() {
             if (!preset) return;
             setPresetRevert({ params: { ...params }, stamp: { ...stamp } });
             // Keep current Size — it's driven by the drawing / measure
-            setParams((p) => ({ ...preset.params, sizeMm: p.sizeMm }));
-            setStamp({ ...preset.stamp });
+            setParams((p) => ({
+              ...preset.params,
+              sizeMm: p.sizeMm,
+              meshQuality: p.meshQuality,
+            }));
+            // Fit gap and raised outline are independent of thickness presets
+            setStamp((s) => ({
+              ...preset.stamp,
+              gapMm: s.gapMm,
+              outlineEnabled: s.outlineEnabled,
+              outlineWidthMm: s.outlineWidthMm,
+            }));
           }}
           canRevertPreset={presetRevert != null}
           onRevertPreset={() => {
@@ -724,6 +1049,10 @@ export default function App() {
         canStamp={canStamp}
         onChoose={handleDownloadChoice}
       />
+      <CoffeeFollowUpDialog
+        open={coffeeFollowUp}
+        onClose={() => setCoffeeFollowUp(false)}
+      />
 
       <Snackbar
         open={!!error}
@@ -740,8 +1069,33 @@ export default function App() {
         autoHideDuration={2500}
         onClose={() => setToast(null)}
         anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
-        message={toast}
-      />
+      >
+        <Box
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 1.25,
+            minWidth: 280,
+            px: 2.5,
+            py: 1.25,
+            borderRadius: 1,
+            bgcolor: "grey.900",
+            color: "common.white",
+            boxShadow: 3,
+          }}
+          role="status"
+        >
+          {toast?.toLowerCase().includes("restored") ? (
+            <Upload size={18} strokeWidth={2} aria-hidden />
+          ) : (
+            <SaveCheck size={18} strokeWidth={2} aria-hidden />
+          )}
+          <Typography component="span" variant="body2">
+            {toast}
+          </Typography>
+        </Box>
+      </Snackbar>
     </Box>
   );
 }
