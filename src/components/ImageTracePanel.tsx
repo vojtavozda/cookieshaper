@@ -6,6 +6,8 @@ import {
   IconButton,
   Stack,
   Switch,
+  Tab,
+  Tabs,
   Tooltip,
   Typography,
 } from "@mui/material";
@@ -16,22 +18,27 @@ import FolderOpenIcon from "@mui/icons-material/FolderOpen";
 import { WheelSlider } from "./WheelSlider";
 import type { TraceMode } from "../geometry/imageContours";
 
+export type TraceTab = "curves" | "area";
+
 type Props = {
   hasImage: boolean;
   threshold: number;
   smooth: number;
+  /** Pixel area below which filled blobs are ignored (Area tab). */
+  minArea: number;
   showBackground: boolean;
-  /** Blue preview contours available for click-to-import. */
-  showTraceCurves: boolean;
-  /** Outlines of blobs vs stroke centerlines. */
+  /** Curves = stroke/outline detect; Area = filled-region outlines. */
+  traceTab: TraceTab;
+  /** Outlines vs stroke centerlines (Curves tab only). */
   traceMode: TraceMode;
   /** 0–1 when image is shown. */
   backgroundOpacity: number;
   curveCount: number;
   onThresholdChange: (v: number) => void;
   onSmoothChange: (v: number) => void;
+  onMinAreaChange: (v: number) => void;
   onShowBackgroundChange: (v: boolean) => void;
-  onShowTraceCurvesChange: (v: boolean) => void;
+  onTraceTabChange: (t: TraceTab) => void;
   onTraceModeChange: (m: TraceMode) => void;
   onBackgroundOpacityChange: (v: number) => void;
   onLoadImage: (url: string) => void;
@@ -39,6 +46,8 @@ type Props = {
   onLoadFile?: (file: File) => void;
   /** Drop the current raster (keeps imported curves). */
   onRemoveImage?: () => void;
+  /** Import every dark blob as filled stamp marks (raised or recessed), holes included. */
+  onApplyAreas?: (raised: boolean) => void;
   onHide: () => void;
 };
 
@@ -46,20 +55,23 @@ export function ImageTracePanel({
   hasImage,
   threshold,
   smooth,
+  minArea,
   showBackground,
-  showTraceCurves,
+  traceTab,
   traceMode,
   backgroundOpacity,
   curveCount,
   onThresholdChange,
   onSmoothChange,
+  onMinAreaChange,
   onShowBackgroundChange,
-  onShowTraceCurvesChange,
+  onTraceTabChange,
   onTraceModeChange,
   onBackgroundOpacityChange,
   onLoadImage,
   onLoadFile,
   onRemoveImage,
+  onApplyAreas,
   onHide,
 }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
@@ -232,19 +244,26 @@ export function ImageTracePanel({
                   />
                 </Box>
 
-                <FormControlLabel
-                  control={
-                    <Switch
-                      size="small"
-                      checked={showTraceCurves}
-                      onChange={(_, v) => onShowTraceCurvesChange(v)}
-                    />
-                  }
-                  label={<Typography variant="caption">Detect curves</Typography>}
-                  sx={{ ml: 0, mr: 0 }}
-                />
+                <Tabs
+                  value={traceTab}
+                  onChange={(_, v: TraceTab) => onTraceTabChange(v)}
+                  centered
+                  sx={{
+                    minHeight: 32,
+                    "& .MuiTab-root": {
+                      minHeight: 32,
+                      py: 0,
+                      px: 1.5,
+                      fontSize: 12,
+                      fontWeight: 700,
+                    },
+                  }}
+                >
+                  <Tab label="Curves" value="curves" />
+                  <Tab label="Area" value="area" />
+                </Tabs>
 
-                {showTraceCurves && (
+                {traceTab === "curves" && (
                   <>
                     <FormControlLabel
                       control={
@@ -316,6 +335,123 @@ export function ImageTracePanel({
                         : traceMode === "lines"
                           ? "No centerlines found — try adjusting threshold"
                           : "No curves found — try adjusting threshold"}
+                    </Typography>
+                  </>
+                )}
+
+                {traceTab === "area" && (
+                  <>
+                    <Box>
+                      <Stack
+                        direction="row"
+                        sx={{ justifyContent: "space-between" }}
+                      >
+                        <Typography variant="caption">Threshold</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {threshold}
+                        </Typography>
+                      </Stack>
+                      <WheelSlider
+                        size="small"
+                        value={threshold}
+                        min={0}
+                        max={255}
+                        step={1}
+                        onChange={(_, v) => onThresholdChange(v as number)}
+                      />
+                    </Box>
+
+                    <Box>
+                      <Stack
+                        direction="row"
+                        sx={{ justifyContent: "space-between" }}
+                      >
+                        <Typography variant="caption">Smoothness</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {smooth.toFixed(2)}
+                        </Typography>
+                      </Stack>
+                      <WheelSlider
+                        size="small"
+                        value={smooth}
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        onChange={(_, v) => onSmoothChange(v as number)}
+                      />
+                    </Box>
+
+                    <Box>
+                      <Stack
+                        direction="row"
+                        sx={{ justifyContent: "space-between" }}
+                      >
+                        <Typography variant="caption">Ignore small</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {minArea} px
+                        </Typography>
+                      </Stack>
+                      <WheelSlider
+                        size="small"
+                        value={minArea}
+                        min={0}
+                        max={2000}
+                        step={10}
+                        onChange={(_, v) => onMinAreaChange(v as number)}
+                      />
+                    </Box>
+
+                    {onApplyAreas && (
+                      <Stack direction="row" spacing={0.5}>
+                        <Tooltip title="Every black shape becomes a filled raised mark. White islands, such as the inside of O, become holes.">
+                          <Button
+                            size="small"
+                            variant="contained"
+                            disabled={curveCount === 0}
+                            onClick={() => onApplyAreas(true)}
+                            sx={{
+                              textTransform: "none",
+                              flex: 1,
+                              minWidth: 0,
+                              height: 30,
+                              py: 0,
+                              bgcolor: "#7f1d1d",
+                              "&:hover": { bgcolor: "#6b1818" },
+                            }}
+                          >
+                            Raised
+                          </Button>
+                        </Tooltip>
+                        <Tooltip title="Every black shape becomes a filled recessed mark. White islands, such as the inside of O, become holes.">
+                          <Button
+                            size="small"
+                            variant="contained"
+                            disabled={curveCount === 0}
+                            onClick={() => onApplyAreas(false)}
+                            sx={{
+                              textTransform: "none",
+                              flex: 1,
+                              minWidth: 0,
+                              height: 30,
+                              py: 0,
+                              bgcolor: "#1e3a8a",
+                              "&:hover": { bgcolor: "#172e6e" },
+                            }}
+                          >
+                            Recessed
+                          </Button>
+                        </Tooltip>
+                      </Stack>
+                    )}
+
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ lineHeight: 1.3 }}
+                    >
+                      {curveCount > 0
+                        ? `${curveCount} outline${curveCount === 1 ? "" : "s"} — adjust, then Raised or Recessed`
+                        : "No filled areas — try threshold or ignore-small"}
                     </Typography>
                   </>
                 )}

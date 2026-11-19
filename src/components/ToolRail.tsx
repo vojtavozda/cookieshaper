@@ -10,7 +10,11 @@ import GridOnIcon from "@mui/icons-material/GridOn";
 import UndoIcon from "@mui/icons-material/Undo";
 import RedoIcon from "@mui/icons-material/Redo";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
-import { Broom } from "lucide-react";
+import {
+  BetweenHorizontalStart,
+  Broom,
+  SquareCenterlineDashedHorizontal,
+} from "lucide-react";
 import { EditCurveIcon } from "./EditCurveIcon";
 
 /** Classic mouse-pointer arrow for object edit mode. */
@@ -55,6 +59,13 @@ type Props = {
   onOpenImagePanel: () => void;
   onDeleteCurrent: () => void;
   canDelete: boolean;
+  /** Flip every curve / stamp vertically about the sketch center. */
+  onMirrorVertical: () => void;
+  canMirror: boolean;
+  /** Stamp layer: swap raised ↔ recessed on marks + outline. */
+  showInvertRelief?: boolean;
+  onInvertRelief?: () => void;
+  canInvertRelief?: boolean;
   /** Remove every curve, stamp feature, and background image. */
   onClearCanvas: () => void;
   canClearCanvas: boolean;
@@ -95,6 +106,11 @@ export function ToolRail({
   onOpenImagePanel,
   onDeleteCurrent,
   canDelete,
+  onMirrorVertical,
+  canMirror,
+  showInvertRelief = false,
+  onInvertRelief,
+  canInvertRelief = false,
   onClearCanvas,
   canClearCanvas,
   onUndo,
@@ -257,6 +273,52 @@ export function ToolRail({
           </IconButton>
         </span>
       </Tooltip>
+
+      <RailSep />
+
+      <Tooltip
+        title={
+          canMirror
+            ? "Mirror — flip all curves horizontally"
+            : "Draw a curve to mirror"
+        }
+        placement="right"
+      >
+        <span>
+          <IconButton
+            size="small"
+            disabled={!canMirror}
+            onClick={onMirrorVertical}
+            sx={railBtnSx}
+            aria-label="Mirror horizontally"
+          >
+            <SquareCenterlineDashedHorizontal size={20} strokeWidth={1.75} />
+          </IconButton>
+        </span>
+      </Tooltip>
+
+      {showInvertRelief && (
+        <Tooltip
+          title={
+            canInvertRelief
+              ? "Invert — swap raised ↔ recessed (marks and outline)"
+              : "Add stamp marks or an outline to invert"
+          }
+          placement="right"
+        >
+          <span>
+            <IconButton
+              size="small"
+              disabled={!canInvertRelief || !onInvertRelief}
+              onClick={onInvertRelief}
+              sx={railBtnSx}
+              aria-label="Invert raised and recessed"
+            >
+              <BetweenHorizontalStart size={20} strokeWidth={1.75} />
+            </IconButton>
+          </span>
+        </Tooltip>
+      )}
 
       <RailSep />
 

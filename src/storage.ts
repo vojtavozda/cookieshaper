@@ -382,3 +382,53 @@ export function bumpCoffeeFollowUpShows(): number {
   }
   return next;
 }
+
+const IMAGE_TRACE_KEY = "pernickovac.imageTrace";
+
+export type ImageTracePrefs = {
+  threshold: number;
+  smooth: number;
+  minArea: number;
+};
+
+const DEFAULT_IMAGE_TRACE: ImageTracePrefs = {
+  threshold: 205,
+  smooth: 0.45,
+  minArea: 40,
+};
+
+export function loadImageTracePrefs(): ImageTracePrefs {
+  try {
+    const raw = localStorage.getItem(IMAGE_TRACE_KEY);
+    if (!raw) return { ...DEFAULT_IMAGE_TRACE };
+    const parsed = JSON.parse(raw) as Partial<ImageTracePrefs>;
+    return {
+      threshold: isFiniteNumber(parsed.threshold)
+        ? Math.min(255, Math.max(0, Math.round(parsed.threshold)))
+        : DEFAULT_IMAGE_TRACE.threshold,
+      smooth: isFiniteNumber(parsed.smooth)
+        ? Math.min(1, Math.max(0, parsed.smooth))
+        : DEFAULT_IMAGE_TRACE.smooth,
+      minArea: isFiniteNumber(parsed.minArea)
+        ? Math.min(2000, Math.max(0, Math.round(parsed.minArea)))
+        : DEFAULT_IMAGE_TRACE.minArea,
+    };
+  } catch {
+    return { ...DEFAULT_IMAGE_TRACE };
+  }
+}
+
+export function saveImageTracePrefs(prefs: ImageTracePrefs) {
+  try {
+    localStorage.setItem(
+      IMAGE_TRACE_KEY,
+      JSON.stringify({
+        threshold: prefs.threshold,
+        smooth: prefs.smooth,
+        minArea: prefs.minArea,
+      }),
+    );
+  } catch {
+    /* private mode / quota */
+  }
+}

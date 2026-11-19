@@ -563,8 +563,8 @@ export type PdfImportResult = {
   background: PdfBackground | null;
   /** Fit gap from `/StampGapMm` when present. */
   stampGapMm: number | null;
-  /** Raised outline from `/StampOutline` when present. */
-  stampOutlineEnabled: boolean | null;
+  /** Outline mode from `/StampOutline` when present. */
+  stampOutlineMode: "raised" | "none" | "recessed" | null;
   /** Outline rim width from `/StampOutlineWidthMm` when present. */
   stampOutlineWidthMm: number | null;
   /** Project title from PDF `/Title` when present (Unicode). */
@@ -657,12 +657,18 @@ export function pdfStampGapMm(data: Uint8Array): number | null {
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
-/** `/StampOutline true|false` written by our exporter. */
-export function pdfStampOutlineEnabled(data: Uint8Array): boolean | null {
+/** `/StampOutline /raised|/none|/recessed` or legacy `true|false`. */
+export function pdfStampOutlineMode(
+  data: Uint8Array,
+): "raised" | "none" | "recessed" | null {
   const text = new TextDecoder("latin1").decode(data);
-  const m = text.match(/\/StampOutline\s+(true|false)/i);
-  if (!m) return null;
-  return m[1].toLowerCase() === "true";
+  const named = text.match(/\/StampOutline\s+\/?(raised|none|recessed)\b/i);
+  if (named) {
+    return named[1].toLowerCase() as "raised" | "none" | "recessed";
+  }
+  const legacy = text.match(/\/StampOutline\s+(true|false)/i);
+  if (!legacy) return null;
+  return legacy[1].toLowerCase() === "true" ? "raised" : "none";
 }
 
 /** `/StampOutlineWidthMm` written by our exporter. */
@@ -780,7 +786,7 @@ export async function pathsFromPdf(data: Uint8Array): Promise<PdfImportResult> {
     mmPerPx,
     background,
     stampGapMm: pdfStampGapMm(data),
-    stampOutlineEnabled: pdfStampOutlineEnabled(data),
+    stampOutlineMode: pdfStampOutlineMode(data),
     stampOutlineWidthMm: pdfStampOutlineWidthMm(data),
     projectName: pdfProjectName(data),
   };

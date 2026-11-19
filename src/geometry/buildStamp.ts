@@ -7,16 +7,28 @@ import {
   FillRule,
   areaD,
   differenceD,
+  intersectD,
   type PathD,
   type PathsD,
 } from "clipper2-ts";
-import type { StampFeatureIn, Vec2 } from "../types";
+import type { StampFeatureIn, StampOutlineMode, Vec2 } from "../types";
+import { parseStampOutlineMode } from "../types";
 import { ensureCcw, mapMm, mmFrame, signedArea } from "./offset";
 import {
   featureFootprints,
   offsetClosedClipper,
   rimAnnulus,
 } from "./stampGeom";
+
+function outlineModeOf(args: {
+  outlineMode?: StampOutlineMode;
+  outlineEnabled?: boolean;
+}): StampOutlineMode {
+  if (args.outlineMode != null) return parseStampOutlineMode(args.outlineMode);
+  if (args.outlineEnabled === false) return "none";
+  if (args.outlineEnabled === true) return "raised";
+  return "raised";
+}
 
 const PLATE_COLOR = 0xd9c4a0;
 /** Slightly darker floor so recessed pockets read against the top face. */
@@ -150,12 +162,32 @@ function footprintsToPaths(loops: Vec2[][]): PathsD {
   return loops.filter((l) => l.length >= 3).map(toPath);
 }
 
-/** Remove hole areas from raised and recessed footprints. */
+/**
+ * Subtract each hole only from larger solids that contain it.
+ * A mark sitting inside a hole (a pupil, a dot) stays; unrelated letters
+ * are left alone.
+ */
 function cutHoles(subjects: PathsD, holes: PathsD): PathsD {
   if (!subjects.length || !holes.length) return subjects;
-  return differenceD(subjects, holes, FillRule.NonZero, 2).filter(
-    (p) => p.length >= 3 && Math.abs(areaD(p)) > 1e-4,
-  );
+  const out: PathsD = [];
+  for (const sub of subjects) {
+    if (sub.length < 3) continue;
+    const subA = Math.abs(areaD(sub));
+    const outer = fromPath(sub);
+    const mine = holes.filter((hole) => {
+      if (hole.length < 3) return false;
+      if (Math.abs(areaD(hole)) >= subA - 1e-4) return false;
+      return pointInRing(outer, ringCentroid(hole));
+    });
+    if (!mine.length) {
+      out.push(sub);
+      continue;
+    }
+    for (const piece of differenceD([sub], mine, FillRule.NonZero, 2)) {
+      if (piece.length >= 3 && Math.abs(areaD(piece)) > 1e-4) out.push(piece);
+    }
+  }
+  return out;
 }
 
 /** Raised pads, recessed pockets, with holes subtracted from both. */
@@ -163,17 +195,36 @@ function stampReliefPaths(
   args: BuildStampArgs,
   frame: ReturnType<typeof mmFrame>,
   stampOutline: Vec2[] | null,
-): { raised: PathsD; recessed: PathsD } {
+): {
+  raised: PathsD;
+  recessed: PathsD;
+  /** Raised plate-edge rim (extruded up). */
+  rim: PathsD;
+  /** Recessed plate-edge rim — kept separate so Area fills cannot steal its hole. */
+  recessedRim: PathsD;
+} {
   const raisedPaths: PathsD = [];
   const recessedPaths: PathsD = [];
   const holePaths: PathsD = [];
+  let rimPaths: PathsD = [];
+  let recessedRim: PathsD = [];
   if (!stampOutline || stampOutline.length < 3) {
-    return { raised: raisedPaths, recessed: recessedPaths };
+    return {
+      raised: raisedPaths,
+      recessed: recessedPaths,
+      rim: rimPaths,
+      recessedRim,
+    };
   }
-  if (args.outlineEnabled !== false) {
+  const mode = outlineModeOf(args);
+  if (mode !== "none") {
     const rimW = Math.max(0.05, args.outlineWidthMm ?? 0.6);
-    const rim = rimAnnulus(stampOutline, rimW);
-    raisedPaths.push(...footprintsToPaths(rim));
+    // Keep the rim annulus out of the feature list. A filled mark that
+    // contains the rim hole's centroid (typical after Area → Apply) would
+    // otherwise adopt that hole, and the outline would become a solid disk.
+    const annulus = footprintsToPaths(rimAnnulus(stampOutline, rimW));
+    if (mode === "raised") rimPaths = annulus;
+    else recessedRim = annulus;
   }
   for (const f of args.features) {
     if (f.points.length < 2) continue;
@@ -188,7 +239,28 @@ function stampReliefPaths(
   return {
     raised: cutHoles(raisedPaths, holePaths),
     recessed: cutHoles(recessedPaths, holePaths),
+    rim: rimPaths,
+    recessedRim,
   };
+}
+
+/**
+ * Carve a recessed rim groove: keep only the plate top inside the rim's
+ * inner edge so the outer band sits at the recess floor. Never merge the
+ * annulus into feature recesses (hole-stealing → solid disk).
+ */
+function applyRecessedRim(
+  outline: Vec2[],
+  topPaths: PathsD,
+  recessedRim: PathsD,
+  rimWidthMm: number,
+): PathsD {
+  if (!recessedRim.length) return topPaths;
+  const rimW = Math.max(0.05, rimWidthMm);
+  const inner = offsetClosedClipper(outline, -rimW);
+  if (!inner || inner.length < 3) return topPaths;
+  const clipped = intersectD(topPaths, [toPath(inner)], FillRule.NonZero, 2);
+  return clipped.filter((p) => p.length >= 3 && Math.abs(areaD(p)) > 1e-4);
 }
 
 /** Dark outline on the plate top so recess / raise boundaries stay visible. */
@@ -229,7 +301,9 @@ export type BuildStampArgs = {
   raiseMm: number;
   recessMm: number;
   features: StampFeatureIn[];
-  /** Raised rim along plate edge (annulus inward from outline). */
+  /** Rim along plate edge (annulus inward from outline). */
+  outlineMode?: StampOutlineMode;
+  /** @deprecated Prefer outlineMode. */
   outlineEnabled?: boolean;
   outlineWidthMm?: number;
   /**
@@ -237,13 +311,20 @@ export type BuildStampArgs = {
    * Mapped with the cutter frame; skips insetting the cutter.
    */
   outlinePx?: Vec2[] | null;
+  /**
+   * Paper-space points that define scale and center for every island.
+   * Defaults to `cutterPx` so a single outline stays unchanged.
+   */
+  framePx?: Vec2[] | null;
 };
 
 export function buildStamp(args: BuildStampArgs): THREE.Group {
   const group = new THREE.Group();
   group.userData.part = "stamp";
   const plate = Math.max(0.4, args.plateMm);
-  const frame = mmFrame(args.cutterPx, args.sizeMm);
+  const frameSrc =
+    args.framePx && args.framePx.length >= 3 ? args.framePx : args.cutterPx;
+  const frame = mmFrame(frameSrc, args.sizeMm);
   const cutterMm = args.cutterPx.map((p) => mapMm(p, frame));
   const inset = Math.max(0.05, args.wallMm / 2 + Math.max(0, args.gapMm));
   const outline =
@@ -252,19 +333,27 @@ export function buildStamp(args: BuildStampArgs): THREE.Group {
       : offsetClosedClipper(cutterMm, -inset);
   if (!outline || outline.length < 3) return group;
 
-  const { raised: raisedPaths, recessed: recessedPaths } = stampReliefPaths(
-    args,
-    frame,
-    outline,
-  );
+  const {
+    raised: raisedPaths,
+    recessed: recessedPaths,
+    rim: rimPaths,
+    recessedRim,
+  } = stampReliefPaths(args, frame, outline);
 
-  const wantRecess = recessedPaths.length > 0 && args.recessMm > 1e-4;
-  const throughHole = wantRecess && args.recessMm >= plate - 1e-6;
+  const wantRecess =
+    (recessedPaths.length > 0 || recessedRim.length > 0) &&
+    args.recessMm > 1e-4;
+  // Through-holes are feature-only — a recessed rim is always a groove.
+  const throughHole =
+    recessedPaths.length > 0 &&
+    recessedRim.length === 0 &&
+    args.recessMm >= plate - 1e-6;
   const recessDepth = wantRecess
     ? throughHole
       ? plate
       : Math.min(Math.max(0.05, args.recessMm), plate)
     : 0;
+  const rimW = Math.max(0.05, args.outlineWidthMm ?? 0.6);
 
   if (throughHole) {
     // Full cut-outs through the plate
@@ -297,12 +386,13 @@ export function buildStamp(args: BuildStampArgs): THREE.Group {
       if (base) group.add(base);
     }
     if (recessDepth > 1e-4) {
-      const topPaths = differenceD(
+      let topPaths = differenceD(
         [toPath(outline)],
         recessedPaths,
         FillRule.NonZero,
         2,
       );
+      topPaths = applyRecessedRim(outline, topPaths, recessedRim, rimW);
       for (const ring of groupRings(topPaths)) {
         const mesh = extrude(ring.outer, ring.holes, recessDepth, baseH, PLATE_COLOR);
         if (mesh) group.add(mesh);
@@ -311,13 +401,27 @@ export function buildStamp(args: BuildStampArgs): THREE.Group {
         r.outer,
         ...r.holes,
       ]);
+      const rimLoops = groupRings(recessedRim).flatMap((r) => [
+        r.outer,
+        ...r.holes,
+      ]);
       // Outline the recess pocket on top + floor (makes flat walls readable)
       addFeatureEdges(group, recessLoops, plate + 0.02, RECESS_EDGE_COLOR);
       addFeatureEdges(group, recessLoops, baseH + 0.02, RECESS_EDGE_COLOR);
+      addFeatureEdges(group, rimLoops, plate + 0.02, RECESS_EDGE_COLOR);
+      addFeatureEdges(group, rimLoops, baseH + 0.02, RECESS_EDGE_COLOR);
     }
   }
 
   const raiseH = Math.max(0, args.raiseMm);
+  if (raiseH > 1e-4 && rimPaths.length) {
+    for (const ring of groupRings(rimPaths)) {
+      const mesh = extrude(ring.outer, ring.holes, raiseH, plate, RAISE_COLOR, {
+        raised: true,
+      });
+      if (mesh) group.add(mesh);
+    }
+  }
   if (raiseH > 1e-4 && raisedPaths.length) {
     for (const ring of groupRings(raisedPaths)) {
       const mesh = extrude(ring.outer, ring.holes, raiseH, plate, RAISE_COLOR, {
@@ -352,7 +456,9 @@ const COOKIE_BUMP = 0xdea05c;
 export function buildCookie(args: BuildStampArgs): THREE.Group {
   const group = new THREE.Group();
   group.userData.part = "cookie";
-  const frame = mmFrame(args.cutterPx, args.sizeMm);
+  const frameSrc =
+    args.framePx && args.framePx.length >= 3 ? args.framePx : args.cutterPx;
+  const frame = mmFrame(frameSrc, args.sizeMm);
   const cutterMm = args.cutterPx.map((p) => mapMm(p, frame));
   const inset = Math.max(0.05, args.wallMm / 2 + Math.max(0, args.gapMm));
   const stampOutline =
@@ -366,8 +472,9 @@ export function buildCookie(args: BuildStampArgs): THREE.Group {
 
   const relief = stampReliefPaths(args, frame, stampOutline);
   // Stamp relief, flipped: what stuck out of the stamp is a dent in the dough.
-  const pockets = mirrorPaths(relief.raised);
-  const bumps = mirrorPaths(relief.recessed);
+  const pockets = mirrorPaths([...relief.rim, ...relief.raised]);
+  const featureBumps = mirrorPaths(relief.recessed);
+  const rimBumps = mirrorPaths(relief.recessedRim);
   const dough = Math.max(6, args.plateMm, args.raiseMm + 1.5);
   const pocket = Math.min(Math.max(0, args.raiseMm), Math.max(0.4, dough - 0.8));
   const bumpH = Math.max(0, args.recessMm);
@@ -389,13 +496,16 @@ export function buildCookie(args: BuildStampArgs): THREE.Group {
     if (slab) group.add(slab);
   }
 
-  if (bumpH > 1e-4 && bumps.length) {
-    for (const ring of groupRings(bumps)) {
-      // No stamp-style emissive — bumps should read as the same dough.
-      const mesh = extrude(ring.outer, ring.holes, bumpH, dough, COOKIE_BUMP, {
-        part,
-      });
-      if (mesh) group.add(mesh);
+  if (bumpH > 1e-4) {
+    // Group rim separately so Area-sized recesses cannot steal the rim hole.
+    for (const paths of [featureBumps, rimBumps]) {
+      if (!paths.length) continue;
+      for (const ring of groupRings(paths)) {
+        const mesh = extrude(ring.outer, ring.holes, bumpH, dough, COOKIE_BUMP, {
+          part,
+        });
+        if (mesh) group.add(mesh);
+      }
     }
   }
   return group;

@@ -5,7 +5,7 @@
 
 import type { SegSnap } from "./pathEdit";
 import type { StampParams } from "../types";
-import { DEFAULT_STAMP } from "../types";
+import { DEFAULT_STAMP, parseStampOutlineMode } from "../types";
 import { DEFAULT_PROJECT_NAME, projectDisplayName } from "../projectName";
 
 export const SKETCH_DRAFT_VERSION = 1 as const;
@@ -29,7 +29,14 @@ export type SketchDraftItem = {
   stampPlate?: boolean;
   /** Cutter generated from the stamp-plate path with this id. */
   derivedFromId?: string;
+  /**
+   * Stamp outline generated from a cutter (inset by wall/2 + fit gap).
+   * Not a source plate — do not outset it into another cutter.
+   */
+  plateFromCutter?: boolean;
 };
+
+export type SketchLinkSource = "cutter" | "stamp" | "decoupled" | null;
 
 export type SketchDraftMeta = {
   version: typeof SKETCH_DRAFT_VERSION;
@@ -39,6 +46,11 @@ export type SketchDraftMeta = {
   stamp: StampParams;
   /** Cutter currently open in stamp-edit mode, if any. */
   stampOwnerId: string | null;
+  /**
+   * Which layer the fit gap follows.
+   * `decoupled` must be stored — otherwise the next open would link them again.
+   */
+  linkSource?: SketchLinkSource;
   bgPlace: { x: number; y: number; width: number; height: number } | null;
   /** True when a background blob was stored alongside this draft. */
   hasBackground: boolean;
@@ -135,10 +147,9 @@ function normalizeStamp(raw: unknown): StampParams {
     recessMm: Number.isFinite(s.recessMm)
       ? (s.recessMm as number)
       : DEFAULT_STAMP.recessMm,
-    outlineEnabled:
-      typeof s.outlineEnabled === "boolean"
-        ? s.outlineEnabled
-        : DEFAULT_STAMP.outlineEnabled,
+    outlineMode: parseStampOutlineMode(
+      s.outlineMode ?? s.outlineEnabled,
+    ),
     outlineWidthMm: Number.isFinite(s.outlineWidthMm)
       ? (s.outlineWidthMm as number)
       : DEFAULT_STAMP.outlineWidthMm,
@@ -193,6 +204,7 @@ async function writeDraft(
     mmPerPx: meta.mmPerPx,
     stamp: normalizeStamp(meta.stamp),
     stampOwnerId: meta.stampOwnerId,
+    linkSource: meta.linkSource ?? null,
     bgPlace: meta.bgPlace,
     hasBackground: !!(meta.background && meta.background.size > 0),
   };
@@ -302,6 +314,7 @@ export async function ensureSketchTabs(fallbackName: string): Promise<SketchTabI
       mmPerPx: legacy.meta.mmPerPx,
       stamp: legacy.meta.stamp,
       stampOwnerId: legacy.meta.stampOwnerId,
+      linkSource: legacy.meta.linkSource ?? null,
       bgPlace: legacy.meta.bgPlace,
       background: legacy.background,
     });

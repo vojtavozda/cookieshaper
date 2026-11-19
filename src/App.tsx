@@ -44,7 +44,7 @@ import {
   fetchHolderStlBytes,
   downloadStampStl,
 } from "./geometry/exportStl";
-import { bboxSize } from "./geometry/offset";
+import { bboxSize, toMm } from "./geometry/offset";
 import {
   DEFAULT_STAMP,
   THICKNESS_PRESETS,
@@ -146,37 +146,112 @@ function exportSizeMm(
   return Math.min(300, Math.max(10, Math.round(longPx * mmPerPx * 10) / 10));
 }
 
-function buildDownloadRoot(
-  pts: Vec2[],
+type MeshScene = {
+  cutterLoops: Vec2[][];
+  outlineLoops: Vec2[][];
+  features: StampFeatureIn[] | null;
+};
+
+const EMPTY_SCENE: MeshScene = {
+  cutterLoops: [],
+  outlineLoops: [],
+  features: null,
+};
+
+function sceneFrame(scene: MeshScene): Vec2[] | null {
+  const pts = scene.cutterLoops.length
+    ? scene.cutterLoops.flat()
+    : scene.outlineLoops.flat();
+  return pts.length >= 3 ? pts : null;
+}
+
+function sceneHasSolid(scene: MeshScene): boolean {
+  if (scene.cutterLoops.some((l) => l.length >= 3)) return true;
+  return !!(scene.features && scene.outlineLoops.some((l) => l.length >= 3));
+}
+
+function buildSceneRoot(
+  scene: MeshScene,
   p: CutterParams,
   method: BuildMethod,
-  features: StampFeatureIn[],
   sp: StampParams,
-  outlinePx: Vec2[] | null,
-): THREE.Group {
-  const { group } = buildCutter(pts, p, method);
-  group.userData.part = "cutter";
-  group.traverse((o) => {
-    o.userData.part = "cutter";
-  });
+  opts?: { cookie?: boolean },
+): { root: THREE.Group; widthMm: number; heightMm: number } {
+  const frame = sceneFrame(scene);
+  if (!frame) throw new Error("Nothing to build");
+  const sized = toMm(frame, p.sizeMm);
   const root = new THREE.Group();
-  root.add(group);
-  root.add(
-    buildStamp({
-      cutterPx: pts,
+  const cutterRoot = new THREE.Group();
+  cutterRoot.userData.part = "cutter";
+  for (const loop of scene.cutterLoops) {
+    if (loop.length < 3) continue;
+    const { group } = buildCutter(loop, p, method, frame);
+    group.userData.part = "cutter";
+    group.traverse((o) => {
+      o.userData.part = "cutter";
+    });
+    cutterRoot.add(group);
+  }
+  if (cutterRoot.children.length) root.add(cutterRoot);
+  if (scene.features) {
+    const stampRoot = new THREE.Group();
+    stampRoot.userData.part = "stamp";
+    const stampBase = {
       sizeMm: p.sizeMm,
       wallMm: p.wallThicknessMm,
       gapMm: sp.gapMm,
       plateMm: sp.plateMm,
       raiseMm: sp.raiseMm,
       recessMm: sp.recessMm,
-      features,
-      outlineEnabled: sp.outlineEnabled,
+      features: scene.features,
+      outlineMode: sp.outlineMode,
       outlineWidthMm: sp.outlineWidthMm,
-      outlinePx,
-    }),
-  );
-  return root;
+      framePx: frame,
+    };
+    const outlines = scene.outlineLoops.filter((l) => l.length >= 3);
+    if (outlines.length) {
+      for (const ol of outlines) {
+        stampRoot.add(
+          buildStamp({
+            ...stampBase,
+            cutterPx: frame,
+            outlinePx: ol,
+          }),
+        );
+      }
+    } else {
+      for (const loop of scene.cutterLoops) {
+        if (loop.length < 3) continue;
+        stampRoot.add(
+          buildStamp({
+            ...stampBase,
+            cutterPx: loop,
+            outlinePx: null,
+          }),
+        );
+      }
+    }
+    if (stampRoot.children.length) root.add(stampRoot);
+    if (opts?.cookie !== false) {
+      const cookieSources = scene.cutterLoops.length
+        ? scene.cutterLoops
+        : outlines;
+      cookieSources.forEach((loop, i) => {
+        if (loop.length < 3) return;
+        const cookie = buildCookie({
+          ...stampBase,
+          cutterPx: loop,
+          outlinePx: outlines[i] ?? (scene.cutterLoops.length ? null : loop),
+        });
+        cookie.visible = false;
+        cookie.traverse((o) => {
+          o.userData.part = "cookie";
+        });
+        root.add(cookie);
+      });
+    }
+  }
+  return { root, widthMm: sized.widthMm, heightMm: sized.heightMm };
 }
 
 function disposeObject3D(root: THREE.Object3D) {
@@ -201,6 +276,9 @@ export default function App() {
   const [path, setPath] = useState<Vec2[] | null>(null);
   const [bgUrl, setBgUrl] = useState<string | null>(null);
   const [deleteToken, setDeleteToken] = useState(0);
+  const [mirrorToken, setMirrorToken] = useState(0);
+  const [invertReliefToken, setInvertReliefToken] = useState(0);
+  const [activeLayer, setActiveLayer] = useState<"cutter" | "stamp">("cutter");
   const [clearToken, setClearToken] = useState(0);
   const [imagePanelToken, setImagePanelToken] = useState(0);
   const [imagePanelOpen, setImagePanelOpen] = useState(false);
@@ -215,8 +293,7 @@ export default function App() {
   const [snapCurves, setSnapCurves] = useState(false);
   const [stamp, setStamp] = useState<StampParams>({ ...DEFAULT_STAMP });
   const [stampFeatures, setStampFeatures] = useState<StampFeatureIn[] | null>(null);
-  /** Plate-edge samples when the stamp outline was drawn before the cutter. */
-  const [stampOutlinePx, setStampOutlinePx] = useState<Vec2[] | null>(null);
+  const [scene, setScene] = useState<MeshScene>(EMPTY_SCENE);
   const [canvasMode, setCanvasMode] = useState<CanvasMode>("draw");
   const [buildMethod, setBuildMethod] = useState<BuildMethod>(() =>
     loadBuildMethod("clipper2"),
@@ -251,71 +328,34 @@ export default function App() {
     loadSketchTabsBarVisible(),
   );
 
-  const hasClosedPath = !!path && path.length >= 3;
+  const hasClosedPath = scene.cutterLoops.some((l) => l.length >= 3);
+  const hasPreview = sceneHasSolid(scene);
   const pathLongPx = useMemo(() => {
-    if (!path || path.length < 3) return null;
-    const { width, height } = bboxSize(path);
+    const frame = sceneFrame(scene);
+    if (!frame) return null;
+    const { width, height } = bboxSize(frame);
     const longPx = Math.max(width, height);
     return longPx > 1e-9 ? longPx : null;
-  }, [path]);
+  }, [scene]);
   const rebuildTimer = useRef<number | null>(null);
   const appliedKeyRef = useRef("");
   const [needsApply, setNeedsApply] = useState(false);
 
   const sceneKey = useCallback(
-    (
-      pts: Vec2[],
-      p: CutterParams,
-      method: BuildMethod,
-      features: StampFeatureIn[] | null,
-      sp: StampParams,
-      outlinePx: Vec2[] | null,
-    ) => JSON.stringify({ pts, p, method, features, sp, outlinePx }),
+    (parts: MeshScene, p: CutterParams, method: BuildMethod, sp: StampParams) =>
+      JSON.stringify({ parts, p, method, sp }),
     [],
   );
 
   const rebuild = useCallback(
-    (
-      pts: Vec2[],
-      p: CutterParams,
-      method: BuildMethod,
-      features: StampFeatureIn[] | null,
-      sp: StampParams,
-      outlinePx: Vec2[] | null,
-    ) => {
+    (parts: MeshScene, p: CutterParams, method: BuildMethod, sp: StampParams) => {
       try {
-        const { group, widthMm, heightMm } = buildCutter(pts, p, method);
-        group.userData.part = "cutter";
-        group.traverse((o) => {
-          o.userData.part = "cutter";
-        });
-        const root = new THREE.Group();
-        root.add(group);
-        const stampArgs = {
-          cutterPx: pts,
-          sizeMm: p.sizeMm,
-          wallMm: p.wallThicknessMm,
-          gapMm: sp.gapMm,
-          plateMm: sp.plateMm,
-          raiseMm: sp.raiseMm,
-          recessMm: sp.recessMm,
-          features: features ?? [],
-          outlineEnabled: sp.outlineEnabled,
-          outlineWidthMm: sp.outlineWidthMm,
-          outlinePx,
-        };
-        if (features) root.add(buildStamp(stampArgs));
-        const cookie = buildCookie(stampArgs);
-        cookie.visible = false;
-        cookie.traverse((o) => {
-          o.userData.part = "cookie";
-        });
-        root.add(cookie);
+        const { root, widthMm, heightMm } = buildSceneRoot(parts, p, method, sp);
         meshRef.current = root;
         setMeshGroup(root);
         setSizeReadout({ widthMm, heightMm });
         setError(null);
-        appliedKeyRef.current = sceneKey(pts, p, method, features, sp, outlinePx);
+        appliedKeyRef.current = sceneKey(parts, p, method, sp);
         setNeedsApply(false);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to build cutter");
@@ -326,18 +366,16 @@ export default function App() {
 
   const scheduleRebuild = useCallback(
     (
-      pts: Vec2[],
+      parts: MeshScene,
       p: CutterParams,
       method: BuildMethod,
-      features: StampFeatureIn[] | null,
       sp: StampParams,
-      outlinePx: Vec2[] | null,
       delayMs: number,
     ) => {
       if (rebuildTimer.current != null) window.clearTimeout(rebuildTimer.current);
       rebuildTimer.current = window.setTimeout(() => {
         rebuildTimer.current = null;
-        rebuild(pts, p, method, features, sp, outlinePx);
+        rebuild(parts, p, method, sp);
       }, delayMs);
     },
     [rebuild],
@@ -384,7 +422,7 @@ export default function App() {
   }, [pathLongPx, mmPerPx]);
 
   useEffect(() => {
-    if (!hasClosedPath || !path) {
+    if (!hasPreview) {
       if (rebuildTimer.current != null) window.clearTimeout(rebuildTimer.current);
       setMeshGroup(null);
       meshRef.current = null;
@@ -394,27 +432,21 @@ export default function App() {
       return;
     }
     if (liveUpdate) {
-      scheduleRebuild(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx, 50);
+      scheduleRebuild(scene, params, buildMethod, stamp, 50);
     } else {
-      setNeedsApply(
-        sceneKey(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx) !==
-          appliedKeyRef.current,
-      );
+      setNeedsApply(sceneKey(scene, params, buildMethod, stamp) !== appliedKeyRef.current);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path, hasClosedPath, buildMethod, liveUpdate, scheduleRebuild, sceneKey, stampFeatures, stamp, stampOutlinePx]);
+  }, [scene, hasPreview, buildMethod, liveUpdate, scheduleRebuild, sceneKey, stamp]);
 
   useEffect(() => {
-    if (!hasClosedPath || !path) return;
+    if (!hasPreview) return;
     if (liveUpdate) {
-      scheduleRebuild(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx, 120);
+      scheduleRebuild(scene, params, buildMethod, stamp, 120);
     } else {
-      setNeedsApply(
-        sceneKey(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx) !==
-          appliedKeyRef.current,
-      );
+      setNeedsApply(sceneKey(scene, params, buildMethod, stamp) !== appliedKeyRef.current);
     }
-  }, [params, buildMethod, liveUpdate, hasClosedPath, path, scheduleRebuild, sceneKey, stamp, stampFeatures, stampOutlinePx]);
+  }, [params, buildMethod, liveUpdate, hasPreview, scene, scheduleRebuild, sceneKey, stamp]);
 
   /** Always-defined scale for measure UI (fallback 1 mm per paper unit). */
   const measureMmPerPx =
@@ -422,7 +454,7 @@ export default function App() {
     (pathLongPx != null ? params.sizeMm / pathLongPx : 1);
 
   const canStamp = !!(meshGroup && stampFeatures);
-  const canCutter = !!meshGroup;
+  const canCutter = !!(meshGroup && hasClosedPath);
 
   const handleDownloadChoice = useCallback(
     async (
@@ -471,18 +503,30 @@ export default function App() {
       await paint();
       const base = uniqueFileBase(sk.name, used);
       if (sk.pdf) files.push({ name: `${base}.pdf`, data: sk.pdf });
-      if (!sk.pts || sk.pts.length < 3 || !sk.features) {
+      const skScene: MeshScene = {
+        cutterLoops:
+          sk.cutterLoops ??
+          (sk.pts && sk.pts.length >= 3 ? [sk.pts] : []),
+        outlineLoops:
+          sk.outlineLoops ??
+          (sk.outlinePx && sk.outlinePx.length >= 3 ? [sk.outlinePx] : []),
+        features: sk.features,
+      };
+      if (!sceneHasSolid(skScene) || !sk.features) {
         onProgress?.(i + 1, total);
         continue;
       }
       try {
-        const root = buildDownloadRoot(
-          sk.pts,
-          { ...params, sizeMm: exportSizeMm(sk.pts, sk.mmPerPx, params.sizeMm) },
+        const frame = sceneFrame(skScene) ?? sk.pts ?? sk.outlinePx ?? [];
+        const { root } = buildSceneRoot(
+          skScene,
+          {
+            ...params,
+            sizeMm: exportSizeMm(frame, sk.mmPerPx, params.sizeMm),
+          },
           buildMethod,
-          sk.features,
           sk.stamp,
-          sk.outlinePx,
+          { cookie: false },
         );
         const stl = await cutterStampStlBytes(root);
         disposeObject3D(root);
@@ -806,6 +850,14 @@ export default function App() {
           }}
           canDelete={hasSelection}
           onDeleteCurrent={() => setDeleteToken((t) => t + 1)}
+          canMirror={hasCurves}
+          onMirrorVertical={() => setMirrorToken((t) => t + 1)}
+          showInvertRelief={activeLayer === "stamp"}
+          canInvertRelief={
+            activeLayer === "stamp" &&
+            (hasCurves || stamp.outlineMode !== "none")
+          }
+          onInvertRelief={() => setInvertReliefToken((t) => t + 1)}
           canClearCanvas={hasCurves || !!bgUrl || !!path || !!stampFeatures}
           onClearCanvas={() => setClearToken((t) => t + 1)}
           canUndo={canUndo}
@@ -842,9 +894,9 @@ export default function App() {
                   wallThicknessMm={params.wallThicknessMm}
                   stampGapMm={stamp.gapMm}
                   onStampGapChange={(gapMm) => setStamp((s) => ({ ...s, gapMm }))}
-                  stampOutlineEnabled={stamp.outlineEnabled}
-                  onStampOutlineEnabledChange={(outlineEnabled) =>
-                    setStamp((s) => ({ ...s, outlineEnabled }))
+                  stampOutlineMode={stamp.outlineMode}
+                  onStampOutlineModeChange={(outlineMode) =>
+                    setStamp((s) => ({ ...s, outlineMode }))
                   }
                   stampOutlineWidthMm={stamp.outlineWidthMm}
                   onStampOutlineWidthChange={(outlineWidthMm) =>
@@ -863,11 +915,13 @@ export default function App() {
                     setActiveSketchId(activeId);
                   }}
                   meshQuality={params.meshQuality}
-                  onStampFeatures={(features, outline) => {
+                  onStampFeatures={(features) => {
                     setStampFeatures(features);
-                    setStampOutlinePx(
-                      outline && outline.length >= 3 ? outline : null,
-                    );
+                  }}
+                  onMeshParts={(parts) => {
+                    setScene(parts);
+                    setStampFeatures(parts.features);
+                    setPath(parts.cutterLoops[0] ?? null);
                   }}
                   mmPerPx={measureMmPerPx}
                   onMmPerPxChange={setMmPerPx}
@@ -908,6 +962,9 @@ export default function App() {
                   onImagePanelOpenChange={setImagePanelOpen}
                   deleteToken={deleteToken}
                   clearToken={clearToken}
+                  mirrorToken={mirrorToken}
+                  invertReliefToken={invertReliefToken}
+                  onActiveLayerChange={setActiveLayer}
                   undoToken={undoToken}
                   redoToken={redoToken}
                   onHasCurvesChange={setHasCurves}
@@ -934,16 +991,13 @@ export default function App() {
           }
           right={
             <Box sx={{ flex: 1, minWidth: 0, minHeight: 0, position: "relative" }}>
-              {hasClosedPath ? (
+              {hasPreview ? (
                 <Viewer3D
                   group={meshGroup}
                   liveUpdate={liveUpdate}
                   needsApply={needsApply}
                   onLiveUpdateChange={setLiveUpdate}
-                  onApply={() =>
-                    path &&
-                      rebuild(path, params, buildMethod, stampFeatures, stamp, stampOutlinePx)
-                  }
+                  onApply={() => rebuild(scene, params, buildMethod, stamp)}
                 />
               ) : (
                 <Box
@@ -961,7 +1015,7 @@ export default function App() {
                     align="center"
                     sx={{ userSelect: "none" }}
                   >
-                    Close a path on the left to preview the 3D cutter here
+                    Draw a closed cutter, or stamp marks, to preview the 3D model here
                   </Typography>
                 </Box>
               )}
@@ -1015,11 +1069,11 @@ export default function App() {
               sizeMm: p.sizeMm,
               meshQuality: p.meshQuality,
             }));
-            // Fit gap and raised outline are independent of thickness presets
+            // Fit gap and outline mode/width are independent of thickness presets
             setStamp((s) => ({
               ...preset.stamp,
               gapMm: s.gapMm,
-              outlineEnabled: s.outlineEnabled,
+              outlineMode: s.outlineMode,
               outlineWidthMm: s.outlineWidthMm,
             }));
           }}

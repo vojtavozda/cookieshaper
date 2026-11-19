@@ -61,24 +61,35 @@ export type StampFeatureIn = {
   widthMm: number;
 };
 
+/** Plate-edge rim: raised band, off, or recessed groove. */
+export type StampOutlineMode = "raised" | "none" | "recessed";
+
 export type StampParams = {
   gapMm: number;
   plateMm: number;
   raiseMm: number;
   recessMm: number;
-  /** Raised rim following the stamp plate edge (inward from fit gap). */
-  outlineEnabled: boolean;
+  /** Rim following the stamp plate edge (inward from fit gap). */
+  outlineMode: StampOutlineMode;
   /** Inward thickness of that rim (mm). */
   outlineWidthMm: number;
 };
 
+/** Coerce draft / PDF / legacy boolean values to a rim mode. */
+export function parseStampOutlineMode(v: unknown): StampOutlineMode {
+  if (v === "raised" || v === "none" || v === "recessed") return v;
+  if (v === true || v === "true") return "raised";
+  if (v === false || v === "false") return "none";
+  return DEFAULT_STAMP.outlineMode;
+}
+
 /** Matches the “Standard” thickness preset plate. */
 export const DEFAULT_STAMP: StampParams = {
-  gapMm: 0.5,
+  gapMm: 0.25,
   plateMm: 2.4,
   raiseMm: 2,
   recessMm: 1,
-  outlineEnabled: true,
+  outlineMode: "raised",
   outlineWidthMm: 0.6,
 };
 
@@ -205,7 +216,7 @@ export function matchesThicknessPreset(
   if (!cutterOk) return false;
   if (!stamp) return nearlyEq(params.baseHeightMm, preset.stamp.plateMm);
   const s = preset.stamp;
-  // gapMm and raised outline are independent of thickness presets.
+  // gapMm and outline mode/width are independent of thickness presets.
   return (
     nearlyEq(stamp.plateMm, s.plateMm) &&
     nearlyEq(stamp.raiseMm, s.raiseMm) &&
