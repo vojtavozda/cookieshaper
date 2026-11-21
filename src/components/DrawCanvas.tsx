@@ -1245,10 +1245,17 @@ export function DrawCanvas({
         const lim = screen(14);
         let best: paper.Point | null = null;
         let bestD = lim;
-        const consider = (
-          item: paper.Path | paper.CompoundPath | null | undefined,
-        ) => {
+        const consider = (item: paper.Item | null | undefined) => {
           if (!item || !item.visible) return;
+          if (item instanceof scope.Group) {
+            for (const child of item.children) consider(child);
+            return;
+          }
+          if (
+            !(item instanceof scope.Path || item instanceof scope.CompoundPath)
+          ) {
+            return;
+          }
           const loc = item.getNearestLocation(pt);
           if (loc && loc.distance < bestD) {
             bestD = loc.distance;
@@ -1473,19 +1480,6 @@ export function DrawCanvas({
       if (fillBest) return fillBest;
       // Raised outline is not selectable — width lives in the Fit gap panel.
       return best;
-    };
-
-    const resolveStampTarget = (): PathMeta | null => {
-      const sel = selectedRef.current;
-      if (sel?.stampPlate) {
-        const derived = derivedFor(sel);
-        if (derived?.path.closed) return derived;
-      }
-      if (sel && isCutterShape(sel) && sel.path.closed) return sel;
-      const closed = metasRef.current.filter(
-        (m) => isCutterShape(m) && m.path.closed && m.path.visible,
-      );
-      return closed.length === 1 ? closed[0] : null;
     };
 
     const clearMeasureLine = () => {
@@ -3216,7 +3210,7 @@ export function DrawCanvas({
         stampRimPreviewRef.current.push(fill);
       }
       // Stamp-first: the Bézier itself is the rim's outer edge.
-      if (outlineModeRef.current === "none") return;
+      // outlineMode "none" already returned above with the early exit.
       const mmPlate = mmPerPxRef.current > 1e-9 ? mmPerPxRef.current : 1;
       for (const plate of metasRef.current) {
         if (!plate.stampPlate || !plate.path.closed || !plate.path.visible) continue;
@@ -3304,7 +3298,7 @@ export function DrawCanvas({
     const rebuildStampOutline = () => {
       const keepRim = !!selectedRef.current?.stampRim;
       try {
-        scope.currentStyle.fillColor = null;
+        scope.project.currentStyle.fillColor = null;
       } catch {
         /* ignore */
       }
@@ -3757,7 +3751,7 @@ export function DrawCanvas({
       }
       // Don't leave Paper's currentStyle stuck on the last filled pad.
       try {
-        scope.currentStyle.fillColor = null;
+        scope.project.currentStyle.fillColor = null;
       } catch {
         /* ignore */
       }

@@ -135,7 +135,10 @@ function idbDel(key: string): Promise<void> {
 }
 
 function normalizeStamp(raw: unknown): StampParams {
-  const s = (raw ?? {}) as Partial<StampParams>;
+  const s = (raw ?? {}) as Partial<StampParams> & {
+    /** Legacy drafts stored a boolean instead of outlineMode. */
+    outlineEnabled?: boolean;
+  };
   return {
     gapMm: Number.isFinite(s.gapMm) ? (s.gapMm as number) : DEFAULT_STAMP.gapMm,
     plateMm: Number.isFinite(s.plateMm)
