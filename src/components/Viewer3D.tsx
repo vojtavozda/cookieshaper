@@ -4,15 +4,17 @@ import {
   Box,
   ScanBox,
   Grid3x3,
-  Ellipse,
+  Cookie,
+  PawPrint,
   Slice,
   Frame,
   Sparkles,
   Sun,
+  RefreshCw,
+  Stamp,
   // Aperture, // SSAO (hidden for now)
   // ImageDown, // preview export (hidden for now)
 } from "lucide-react";
-import ApprovalOutlinedIcon from "@mui/icons-material/ApprovalOutlined";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
@@ -20,16 +22,27 @@ import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { SSAOPass } from "three/examples/jsm/postprocessing/SSAOPass.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import {
+  loadCookieEdgeHighlights,
+  loadEdgeHighlights,
   loadHighlightTip,
   loadOrthographic,
+  loadShowCookie,
   loadWireframe,
+  saveCookieEdgeHighlights,
+  saveEdgeHighlights,
   saveHighlightTip,
   saveOrthographic,
+  saveShowCookie,
   saveWireframe,
 } from "../storage";
 
 type Props = {
   group: THREE.Group | null;
+  liveUpdate: boolean;
+  /** Pending sketch/param changes not yet applied to the 3D view. */
+  needsApply: boolean;
+  onLiveUpdateChange: (v: boolean) => void;
+  onApply: () => void;
 };
 
 type SceneCtx = {
@@ -117,10 +130,19 @@ function applyKnifeTipHighlight(root: THREE.Object3D, on: boolean) {
   });
 }
 
-function applyPartVisibility(root: THREE.Object3D, cutter: boolean, stamp: boolean) {
+function applyPartVisibility(
+  root: THREE.Object3D,
+  cutter: boolean,
+  stamp: boolean,
+  cookie: boolean,
+) {
   root.traverse((o) => {
-    if (o.userData.part === "cutter") o.visible = cutter;
-    if (o.userData.part === "stamp") o.visible = stamp;
+    // Edge overlays follow their parent mesh; leave their own .visible to
+    // applyEdgeHighlights so mode switches do not force edges back on.
+    if (o.userData.edgeOverlay) return;
+    if (o.userData.part === "cutter") o.visible = !cookie && cutter;
+    if (o.userData.part === "stamp") o.visible = !cookie && stamp;
+    if (o.userData.part === "cookie") o.visible = cookie;
   });
 }
 
@@ -236,25 +258,36 @@ function disposeViewerObject(root: THREE.Object3D) {
   });
 }
 
-export function Viewer3D({ group }: Props) {
+export function Viewer3D({
+  group,
+  liveUpdate,
+  needsApply,
+  onLiveUpdateChange,
+  onApply,
+}: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<SceneCtx | null>(null);
   const [orthographic, setOrthographic] = useState(() => loadOrthographic());
   const [highlightTip, setHighlightTip] = useState(() => loadHighlightTip());
   const [wireframe, setWireframe] = useState(() => loadWireframe());
-  const [edgeHighlights, setEdgeHighlights] = useState(true);
+  const [edgeHighlights, setEdgeHighlights] = useState(() => loadEdgeHighlights());
+  const [cookieEdgeHighlights, setCookieEdgeHighlights] = useState(() =>
+    loadCookieEdgeHighlights(),
+  );
   const [shinierPbr, setShinierPbr] = useState(false);
   const [strongLight, setStrongLight] = useState(false);
   const [ssao] = useState(false); // toggle UI hidden for now
   const [showCutter, setShowCutter] = useState(true);
   const [showStamp, setShowStamp] = useState(true);
+  const [showCookie, setShowCookie] = useState(() => loadShowCookie());
+  const activeEdgeHighlights = showCookie ? cookieEdgeHighlights : edgeHighlights;
 
   const highlightTipRef = useRef(highlightTip);
   highlightTipRef.current = highlightTip;
   const wireframeRef = useRef(wireframe);
   wireframeRef.current = wireframe;
-  const edgesRef = useRef(edgeHighlights);
-  edgesRef.current = edgeHighlights;
+  const edgesRef = useRef(activeEdgeHighlights);
+  edgesRef.current = activeEdgeHighlights;
   const shinyRef = useRef(shinierPbr);
   shinyRef.current = shinierPbr;
 
@@ -269,6 +302,18 @@ export function Viewer3D({ group }: Props) {
   useEffect(() => {
     saveWireframe(wireframe);
   }, [wireframe]);
+
+  useEffect(() => {
+    saveShowCookie(showCookie);
+  }, [showCookie]);
+
+  useEffect(() => {
+    saveEdgeHighlights(edgeHighlights);
+  }, [edgeHighlights]);
+
+  useEffect(() => {
+    saveCookieEdgeHighlights(cookieEdgeHighlights);
+  }, [cookieEdgeHighlights]);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -487,8 +532,8 @@ export function Viewer3D({ group }: Props) {
   useEffect(() => {
     const ctx = sceneRef.current;
     if (!ctx) return;
-    applyPartVisibility(ctx.root, showCutter, showStamp);
-  }, [showCutter, showStamp, group]);
+    applyPartVisibility(ctx.root, showCutter, showStamp, showCookie);
+  }, [showCutter, showStamp, showCookie, group]);
 
   useEffect(() => {
     const ctx = sceneRef.current;
@@ -499,14 +544,14 @@ export function Viewer3D({ group }: Props) {
   useEffect(() => {
     const ctx = sceneRef.current;
     if (!ctx) return;
-    applyWireframe(ctx.root, wireframe, edgeHighlights);
-  }, [wireframe, edgeHighlights]);
+    applyWireframe(ctx.root, wireframe, activeEdgeHighlights);
+  }, [wireframe, activeEdgeHighlights]);
 
   useEffect(() => {
     const ctx = sceneRef.current;
     if (!ctx) return;
-    applyEdgeHighlights(ctx.root, edgeHighlights, wireframe);
-  }, [edgeHighlights, wireframe, group]);
+    applyEdgeHighlights(ctx.root, activeEdgeHighlights, wireframe);
+  }, [activeEdgeHighlights, wireframe, group]);
 
   useEffect(() => {
     const ctx = sceneRef.current;
@@ -550,21 +595,101 @@ export function Viewer3D({ group }: Props) {
         }}
       >
         <Stack spacing={0.15}>
-          {/* Preview export — hidden for now
-          <Tooltip title="Save preview image" placement="right">
+          <Tooltip
+            title={
+              showCookie
+                ? "Show the cutter and stamp"
+                : "Show the resulting cookie"
+            }
+            placement="right"
+          >
             <IconButton
               size="small"
-              onClick={() => {
-                const ctx = sceneRef.current;
-                if (ctx) exportPreviewPng(ctx);
-              }}
-              aria-label="Save preview image"
+              color={showCookie ? "primary" : "default"}
+              onClick={() => setShowCookie((v) => !v)}
+              aria-label="Toggle resulting cookie"
               sx={lucideBtnSx}
             >
-              <LucideIcon Icon={ImageDown} />
+              <LucideIcon Icon={Cookie} active={showCookie} />
             </IconButton>
           </Tooltip>
-          */}
+          <Divider
+            flexItem
+            sx={{ width: 28, alignSelf: "center", borderColor: "divider", my: 0.35 }}
+          />
+          <Tooltip
+            title={
+              showCookie
+                ? "Unavailable in cookie view"
+                : showCutter
+                  ? "Hide cutter"
+                  : "Show cutter"
+            }
+            placement="right"
+          >
+            <span>
+              <IconButton
+                size="small"
+                disabled={showCookie}
+                color={showCutter && !showCookie ? "primary" : "default"}
+                onClick={() => setShowCutter((v) => !v)}
+                aria-label="Toggle cutter"
+                sx={lucideBtnSx}
+              >
+                <LucideIcon Icon={PawPrint} active={showCutter && !showCookie} />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip
+            title={
+              showCookie
+                ? "Unavailable in cookie view"
+                : showStamp
+                  ? "Hide stamp"
+                  : "Show stamp"
+            }
+            placement="right"
+          >
+            <span>
+              <IconButton
+                size="small"
+                disabled={showCookie}
+                color={showStamp && !showCookie ? "primary" : "default"}
+                onClick={() => setShowStamp((v) => !v)}
+                aria-label="Toggle stamp"
+                sx={lucideBtnSx}
+              >
+                <LucideIcon Icon={Stamp} active={showStamp && !showCookie} />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip
+            title={
+              showCookie
+                ? "Unavailable in cookie view"
+                : highlightTip
+                  ? "Hide cutting edge"
+                  : "Highlight cutting edge"
+            }
+            placement="right"
+          >
+            <span>
+              <IconButton
+                size="small"
+                disabled={showCookie}
+                color={highlightTip && !showCookie ? "primary" : "default"}
+                onClick={() => setHighlightTip((v) => !v)}
+                aria-label="Toggle cutting edge highlight"
+                sx={lucideBtnSx}
+              >
+                <LucideIcon Icon={Slice} active={highlightTip && !showCookie} />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Divider
+            flexItem
+            sx={{ width: 28, alignSelf: "center", borderColor: "divider", my: 0.35 }}
+          />
           <Tooltip
             title={orthographic ? "Perspective view" : "Orthographic view"}
             placement="right"
@@ -597,17 +722,25 @@ export function Viewer3D({ group }: Props) {
             </IconButton>
           </Tooltip>
           <Tooltip
-            title={edgeHighlights ? "Hide edge highlights" : "Show edge highlights"}
+            title={
+              activeEdgeHighlights
+                ? "Hide edge highlights"
+                : "Show edge highlights"
+            }
             placement="right"
           >
             <IconButton
               size="small"
-              color={edgeHighlights ? "primary" : "default"}
-              onClick={() => setEdgeHighlights((v) => !v)}
+              color={activeEdgeHighlights ? "primary" : "default"}
+              onClick={() =>
+                showCookie
+                  ? setCookieEdgeHighlights((v) => !v)
+                  : setEdgeHighlights((v) => !v)
+              }
               aria-label="Toggle edge highlights"
               sx={lucideBtnSx}
             >
-              <LucideIcon Icon={Frame} active={edgeHighlights} />
+              <LucideIcon Icon={Frame} active={activeEdgeHighlights} />
             </IconButton>
           </Tooltip>
           <Tooltip
@@ -656,47 +789,27 @@ export function Viewer3D({ group }: Props) {
             sx={{ width: 28, alignSelf: "center", borderColor: "divider", my: 0.35 }}
           />
           <Tooltip
-            title={showCutter ? "Hide cutter" : "Show cutter"}
-            placement="right"
-          >
-            <IconButton
-              size="small"
-              color={showCutter ? "primary" : "default"}
-              onClick={() => setShowCutter((v) => !v)}
-              aria-label="Toggle cutter"
-              sx={lucideBtnSx}
-            >
-              <LucideIcon Icon={Ellipse} active={showCutter} />
-            </IconButton>
-          </Tooltip>
-          <Tooltip
-            title={showStamp ? "Hide stamp" : "Show stamp"}
-            placement="right"
-          >
-            <IconButton
-              size="small"
-              color={showStamp ? "primary" : "default"}
-              onClick={() => setShowStamp((v) => !v)}
-              aria-label="Toggle stamp"
-              sx={lucideBtnSx}
-            >
-              <ApprovalOutlinedIcon fontSize="small" />
-            </IconButton>
-          </Tooltip>
-          <Tooltip
             title={
-              highlightTip ? "Hide cutting edge" : "Highlight cutting edge"
+              liveUpdate
+                ? "Live 3D update on"
+                : needsApply
+                  ? "Apply to 3D view"
+                  : "Live 3D update off"
             }
             placement="right"
           >
             <IconButton
               size="small"
-              color={highlightTip ? "primary" : "default"}
-              onClick={() => setHighlightTip((v) => !v)}
-              aria-label="Toggle cutting edge highlight"
+              color={liveUpdate || needsApply ? "primary" : "default"}
+              onClick={() => {
+                if (liveUpdate) onLiveUpdateChange(false);
+                else if (needsApply) onApply();
+                else onLiveUpdateChange(true);
+              }}
+              aria-label="Live 3D update"
               sx={lucideBtnSx}
             >
-              <LucideIcon Icon={Slice} active={highlightTip} />
+              <LucideIcon Icon={RefreshCw} active={liveUpdate || needsApply} />
             </IconButton>
           </Tooltip>
         </Stack>

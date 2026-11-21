@@ -27,18 +27,25 @@ export type CutterParams = {
    * collapses into stacked single-line walls in the slicer. Clamped to wall thickness.
    */
   knifeTipMm: number;
+  /**
+   * How finely smooth curves are sampled into the 3D mesh (1–5).
+   * 2 matches the original density; higher keeps more of each Bézier.
+   */
+  meshQuality: number;
 };
 
+/** Matches the “Standard” thickness preset (size / mesh quality are independent). */
 export const DEFAULT_PARAMS: CutterParams = {
   sizeMm: 80,
-  rimWidthMm: 4,
-  baseHeightMm: 3,
+  rimWidthMm: 2.6 + 0.8 / 2,
+  baseHeightMm: 2.4,
   wallThicknessMm: 0.8,
-  wallHeightMm: 12,
-  filletRadiusMm: 2,
+  wallHeightMm: 11,
+  filletRadiusMm: 1,
   bevelLayerMm: 0.2,
-  knifeHeightMm: 0.8,
-  knifeTipMm: 0.3,
+  knifeHeightMm: 1,
+  knifeTipMm: 0,
+  meshQuality: 3,
 };
 
 export type SizeReadout = { widthMm: number; heightMm: number };
@@ -49,26 +56,40 @@ export type StampFeatureIn = {
   closed: boolean;
   filled: boolean;
   raised: boolean;
+  /** Subtracts this area from both raised and recessed marks. */
+  hole?: boolean;
   widthMm: number;
 };
+
+/** Plate-edge rim: raised band, off, or recessed groove. */
+export type StampOutlineMode = "raised" | "none" | "recessed";
 
 export type StampParams = {
   gapMm: number;
   plateMm: number;
   raiseMm: number;
   recessMm: number;
-  /** Raised rim following the stamp plate edge (inward from fit gap). */
-  outlineEnabled: boolean;
+  /** Rim following the stamp plate edge (inward from fit gap). */
+  outlineMode: StampOutlineMode;
   /** Inward thickness of that rim (mm). */
   outlineWidthMm: number;
 };
 
+/** Coerce draft / PDF / legacy boolean values to a rim mode. */
+export function parseStampOutlineMode(v: unknown): StampOutlineMode {
+  if (v === "raised" || v === "none" || v === "recessed") return v;
+  if (v === true || v === "true") return "raised";
+  if (v === false || v === "false") return "none";
+  return DEFAULT_STAMP.outlineMode;
+}
+
+/** Matches the “Standard” thickness preset plate. */
 export const DEFAULT_STAMP: StampParams = {
-  gapMm: 0.5,
-  plateMm: 3,
+  gapMm: 0.25,
+  plateMm: 2.4,
   raiseMm: 2,
   recessMm: 1,
-  outlineEnabled: true,
+  outlineMode: "raised",
   outlineWidthMm: 0.6,
 };
 
@@ -94,9 +115,19 @@ function makePreset(opts: {
   wallThicknessMm: number;
   filletRadiusMm: number;
   knifeHeightMm: number;
+  knifeTipMm: number;
+  /** Overall cutter height including the knife (UI “Height”). */
+  overallHeightMm: number;
 }): { params: CutterParams; stamp: StampParams } {
-  const { baseHeightMm, baseWidthMm, wallThicknessMm, filletRadiusMm, knifeHeightMm } =
-    opts;
+  const {
+    baseHeightMm,
+    baseWidthMm,
+    wallThicknessMm,
+    filletRadiusMm,
+    knifeHeightMm,
+    knifeTipMm,
+    overallHeightMm,
+  } = opts;
   return {
     params: {
       ...DEFAULT_PARAMS,
@@ -105,6 +136,9 @@ function makePreset(opts: {
       rimWidthMm: baseWidthMm + wallThicknessMm / 2,
       filletRadiusMm,
       knifeHeightMm,
+      knifeTipMm,
+      // Stored wall is the straight section under the knife.
+      wallHeightMm: Math.max(0, overallHeightMm - knifeHeightMm),
     },
     stamp: {
       ...DEFAULT_STAMP,
@@ -125,18 +159,22 @@ export const THICKNESS_PRESETS: ThicknessPreset[] = [
       wallThicknessMm: 0.8,
       filletRadiusMm: 0,
       knifeHeightMm: 0,
+      knifeTipMm: 0,
+      overallHeightMm: 12,
     }),
   },
   {
     id: "standard",
     label: "Standard",
-    hint: "2.6 mm base/plate, 1 mm wall, 2 mm bevel, 1 mm knife — everyday use",
+    hint: "2.4 mm base/plate, 0.8 mm wall, 1 mm bevel, 1 mm knife — everyday use",
     ...makePreset({
-      baseHeightMm: 2.6,
-      baseWidthMm: 3,
-      wallThicknessMm: 1,
-      filletRadiusMm: 2,
+      baseHeightMm: 2.4,
+      baseWidthMm: 2.6,
+      wallThicknessMm: 0.8,
+      filletRadiusMm: 1,
       knifeHeightMm: 1,
+      knifeTipMm: 0,
+      overallHeightMm: 12,
     }),
   },
   {
@@ -149,6 +187,8 @@ export const THICKNESS_PRESETS: ThicknessPreset[] = [
       wallThicknessMm: 1.2,
       filletRadiusMm: 2,
       knifeHeightMm: 1.2,
+      knifeTipMm: 0.3,
+      overallHeightMm: 12,
     }),
   },
 ];
@@ -176,15 +216,16 @@ export function matchesThicknessPreset(
   if (!cutterOk) return false;
   if (!stamp) return nearlyEq(params.baseHeightMm, preset.stamp.plateMm);
   const s = preset.stamp;
+  // gapMm and outline mode/width are independent of thickness presets.
   return (
-    nearlyEq(stamp.gapMm, s.gapMm) &&
     nearlyEq(stamp.plateMm, s.plateMm) &&
     nearlyEq(stamp.raiseMm, s.raiseMm) &&
-    nearlyEq(stamp.recessMm, s.recessMm) &&
-    stamp.outlineEnabled === s.outlineEnabled &&
-    nearlyEq(stamp.outlineWidthMm, s.outlineWidthMm)
+    nearlyEq(stamp.recessMm, s.recessMm)
   );
 }
+
+/** Wall-profile overlay on the 3D view. */
+export type WallProfileMode = "hidden" | "large";
 
 /** How the 3D cutter solid is built. */
 export type BuildMethod = "current" | "stacked" | "clipper2";

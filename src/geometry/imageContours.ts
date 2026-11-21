@@ -146,6 +146,232 @@ export function findContours(
   return contours.sort((a, b) => b.length - a.length);
 }
 
+/** One dark blob: its outline, plus every enclosed white island. */
+export type StampBlob = {
+  outer: Contour;
+  holes: Contour[];
+};
+
+function traceLoop(
+  inside: (x: number, y: number) => boolean,
+  w: number,
+  h: number,
+  sx: number,
+  sy: number,
+): Contour | null {
+  const contour: Contour = [];
+  let x = sx;
+  let y = sy;
+  let dir = 0;
+  const maxSteps = w * h * 2;
+  for (let step = 0; step < maxSteps; step++) {
+    contour.push({ x, y });
+    let found = false;
+    for (let k = 0; k < 8; k++) {
+      const nd = (dir + 6 + k) % 8;
+      const [dx, dy] = N8[nd];
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < w && ny < h && inside(nx, ny)) {
+        x = nx;
+        y = ny;
+        dir = nd;
+        found = true;
+        break;
+      }
+    }
+    if (!found) break;
+    if (x === sx && y === sy && contour.length > 2) break;
+  }
+  if (contour.length < 6) return null;
+  return contour;
+}
+
+function firstPixel(
+  w: number,
+  h: number,
+  hit: (x: number, y: number) => boolean,
+): { x: number; y: number } | null {
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (hit(x, y)) return { x, y };
+    }
+  }
+  return null;
+}
+
+function prepareStampRing(pts: Contour, amount: number): Contour {
+  const amt = Math.min(1, Math.max(0, amount));
+  const smoothed =
+    amt <= 0.12 ? pts : smoothClosedContour(pts, Math.min(1, (amt - 0.12) * 0.7));
+  // ~1px epsilon removes stair-steps; corners of a letter sit much farther off the chord.
+  const eps = 1.05 + amt * 4;
+  const maxPts = Math.max(16, Math.round(900 - amt * 720));
+  return simplifyClosedCapped(smoothed, eps, maxPts);
+}
+
+/**
+ * Every dark connected region, with enclosed white islands as holes.
+ * Unlike {@link findContours}, this is not capped at a handful of outlines
+ * and it keeps counters (the hole in an O, spots in a silhouette).
+ */
+export function findStampBlobs(
+  imageData: ImageData,
+  threshold: number,
+  opts?: { minArea?: number; simplifyAmount?: number },
+): StampBlob[] {
+  const w = imageData.width;
+  const h = imageData.height;
+  const bin = thresholdMask(imageData, threshold);
+  const minArea = opts?.minArea ?? 8;
+  const amt = opts?.simplifyAmount ?? 0;
+  const idx = (x: number, y: number) => y * w + x;
+
+  const label = new Int32Array(w * h);
+  const areas: number[] = [0];
+  const touches: number[] = [0];
+  let nLab = 0;
+  const stack: number[] = [];
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const start = idx(x, y);
+      if (bin[start] !== 1 || label[start] !== 0) continue;
+      nLab++;
+      let area = 0;
+      let touch = 0;
+      stack.push(start);
+      label[start] = nLab;
+      while (stack.length) {
+        const cur = stack.pop()!;
+        area++;
+        const cx = cur % w;
+        const cy = (cur / w) | 0;
+        if (cx === 0 || cy === 0 || cx === w - 1 || cy === h - 1) touch = 1;
+        for (let k = 0; k < 8; k++) {
+          const nx = cx + N8[k][0];
+          const ny = cy + N8[k][1];
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const ni = idx(nx, ny);
+          if (bin[ni] !== 1 || label[ni] !== 0) continue;
+          label[ni] = nLab;
+          stack.push(ni);
+        }
+      }
+      areas[nLab] = area;
+      touches[nLab] = touch;
+    }
+  }
+
+  const page = w * h;
+  const keep = new Uint8Array(nLab + 1);
+  for (let id = 1; id <= nLab; id++) {
+    const huge = touches[id] === 1 && areas[id] > page * 0.45;
+    keep[id] = !huge && areas[id] >= minArea ? 1 : 0;
+  }
+
+  const holeId = new Int32Array(w * h);
+  const holeArea: number[] = [0];
+  const holeTouch: number[] = [0];
+  const holeParent: number[] = [0];
+  let nHole = 0;
+  const N4: [number, number][] = [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ];
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const start = idx(x, y);
+      if (bin[start] !== 0 || holeId[start] !== 0) continue;
+      nHole++;
+      let area = 0;
+      let touch = 0;
+      const parentCount = new Map<number, number>();
+      stack.push(start);
+      holeId[start] = nHole;
+      while (stack.length) {
+        const cur = stack.pop()!;
+        area++;
+        const cx = cur % w;
+        const cy = (cur / w) | 0;
+        if (cx === 0 || cy === 0 || cx === w - 1 || cy === h - 1) touch = 1;
+        for (const [dx, dy] of N4) {
+          const nx = cx + dx;
+          const ny = cy + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const ni = idx(nx, ny);
+          if (bin[ni] === 0) {
+            if (holeId[ni] === 0) {
+              holeId[ni] = nHole;
+              stack.push(ni);
+            }
+          } else if (keep[label[ni]]) {
+            const L = label[ni];
+            parentCount.set(L, (parentCount.get(L) ?? 0) + 1);
+          }
+        }
+      }
+      holeArea[nHole] = area;
+      holeTouch[nHole] = touch;
+      let best = 0;
+      let bestN = 0;
+      for (const [L, n] of parentCount) {
+        if (n > bestN) {
+          bestN = n;
+          best = L;
+        }
+      }
+      holeParent[nHole] = best;
+    }
+  }
+
+  const holesByParent = new Map<number, Contour[]>();
+  for (let hid = 1; hid <= nHole; hid++) {
+    if (holeTouch[hid] || holeArea[hid] < minArea || !holeParent[hid]) continue;
+    const seed = firstPixel(w, h, (x, y) => holeId[idx(x, y)] === hid);
+    if (!seed) continue;
+    const loop = traceLoop(
+      (x, y) => holeId[idx(x, y)] === hid,
+      w,
+      h,
+      seed.x,
+      seed.y,
+    );
+    if (!loop) continue;
+    const ring = prepareStampRing(loop, amt);
+    if (ring.length < 3) continue;
+    const list = holesByParent.get(holeParent[hid]) ?? [];
+    list.push(ring);
+    holesByParent.set(holeParent[hid], list);
+  }
+
+  const blobs: { area: number; blob: StampBlob }[] = [];
+  for (let id = 1; id <= nLab; id++) {
+    if (!keep[id]) continue;
+    const seed = firstPixel(w, h, (x, y) => label[idx(x, y)] === id);
+    if (!seed) continue;
+    const loop = traceLoop(
+      (x, y) => label[idx(x, y)] === id,
+      w,
+      h,
+      seed.x,
+      seed.y,
+    );
+    if (!loop) continue;
+    const outer = prepareStampRing(loop, amt);
+    if (outer.length < 3) continue;
+    blobs.push({
+      area: areas[id],
+      blob: { outer, holes: holesByParent.get(id) ?? [] },
+    });
+  }
+  blobs.sort((a, b) => b.area - a.area);
+  return blobs.map((b) => b.blob);
+}
+
 /** Periodic moving-average smooth for a closed polyline. `amount` 0–1. */
 export function smoothClosedContour(pts: Contour, amount: number): Contour {
   if (pts.length < 3 || amount <= 0.01) return pts.map((p) => ({ ...p }));

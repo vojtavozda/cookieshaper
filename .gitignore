@@ -16,6 +16,7 @@ dist-ssr
 
 # Local scratch / reference exports (not part of the app)
 sketches/
+private/
 
 # Editor directories and files
 .vscode/*

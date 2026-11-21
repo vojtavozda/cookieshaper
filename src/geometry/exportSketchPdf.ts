@@ -21,14 +21,33 @@ function fmt(n: number): string {
   return String(v);
 }
 
-function pathOps(
+/**
+ * PDF text string (Info dict): UTF-16BE with BOM as a hex string,
+ * so titles can keep accents and other non-Latin1 characters.
+ */
+export function pdfInfoText(value: string): string {
+  const units: number[] = [0xfe, 0xff];
+  for (const ch of value) {
+    const cp = ch.codePointAt(0)!;
+    if (cp > 0xffff) {
+      const v = cp - 0x10000;
+      const hi = 0xd800 + (v >> 10);
+      const lo = 0xdc00 + (v & 0x3ff);
+      units.push((hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff);
+    } else {
+      units.push((cp >> 8) & 0xff, cp & 0xff);
+    }
+  }
+  return `<${units.map((b) => b.toString(16).padStart(2, "0")).join("")}>`;
+}
+
+function ringOps(
   segs: ImportedSeg[],
   closed: boolean,
   ox: number,
   oy: number,
-  paint: "S" | "B" = "S",
-): string {
-  if (segs.length < 2) return "";
+): string[] {
+  if (segs.length < 2) return [];
   const parts: string[] = [];
   const x = (s: ImportedSeg) => s.point.x - ox;
   const y = (s: ImportedSeg) => s.point.y - oy;
@@ -75,8 +94,34 @@ function pathOps(
     }
     parts.push("h");
   }
+  return parts;
+}
+
+function pathOps(
+  segs: ImportedSeg[],
+  closed: boolean,
+  ox: number,
+  oy: number,
+  paint: "S" | "B" | "f*" = "S",
+  holes?: ImportedSeg[][],
+): string {
+  if (segs.length < 2) return "";
+  const parts = ringOps(segs, closed, ox, oy);
+  if (holes?.length) {
+    for (const hole of holes) {
+      parts.push(...ringOps(hole, true, ox, oy));
+    }
+  }
   parts.push(paint);
   return parts.join("\n") + "\n";
+}
+
+function scaleSegs(segs: ImportedSeg[], k: number): ImportedSeg[] {
+  return segs.map((s) => ({
+    point: { x: s.point.x * k, y: s.point.y * k },
+    handleIn: { x: s.handleIn.x * k, y: s.handleIn.y * k },
+    handleOut: { x: s.handleOut.x * k, y: s.handleOut.y * k },
+  }));
 }
 
 /** Scale paper-space paths into PDF points (true millimetres). */
@@ -84,11 +129,8 @@ function toPdfPoints(paths: ImportedPath[], mmPerPx: number): ImportedPath[] {
   const k = mmPerPx * PT_PER_MM; // paper → pt
   return paths.map((p) => ({
     ...p,
-    segments: p.segments.map((s) => ({
-      point: { x: s.point.x * k, y: s.point.y * k },
-      handleIn: { x: s.handleIn.x * k, y: s.handleIn.y * k },
-      handleOut: { x: s.handleOut.x * k, y: s.handleOut.y * k },
-    })),
+    segments: scaleSegs(p.segments, k),
+    holes: p.holes?.map((h) => scaleSegs(h, k)),
     // widthMm → stroke in PDF points
     strokePt:
       p.strokePt ??
@@ -114,10 +156,14 @@ export type SketchPdfOptions = {
   background?: SketchPdfBackground | null;
   /** Stamp fit gap (mm) stored in PDF Info for round-trip. */
   stampGapMm?: number | null;
-  /** Raised outline rim toggle for round-trip. */
+  /** Outline rim mode for round-trip (`raised` | `none` | `recessed`). */
+  stampOutlineMode?: "raised" | "none" | "recessed" | null;
+  /** @deprecated Prefer stampOutlineMode. */
   stampOutlineEnabled?: boolean | null;
-  /** Raised outline rim width (mm) for round-trip. */
+  /** Outline rim width (mm) for round-trip. */
   stampOutlineWidthMm?: number | null;
+  /** Project / cookie title stored as PDF `/Title` (Unicode-safe). */
+  projectName?: string | null;
 };
 
 /** Encode a raster URL / data-URL as JPEG for PDF embedding. */
@@ -245,8 +291,18 @@ export function buildSketchPdf(
       `${fmt(rgb[0])} ${fmt(rgb[1])} ${fmt(rgb[2])} rg`,
       `${fmt(w)} w`,
     );
-    const paint = p.filled && p.closed ? "B" : "S";
-    body.push(pathOps(p.segments, p.closed, ox, oy, paint).trimEnd());
+    const hasHoles = !!(p.holes && p.holes.length > 0);
+    // Rim annulus: even-odd fill only. Features: fill+stroke. Else stroke.
+    const paint: "S" | "B" | "f*" = p.stampRim
+      ? "f*"
+      : hasHoles && p.filled
+        ? "f*"
+        : p.filled && p.closed
+          ? "B"
+          : "S";
+    body.push(
+      pathOps(p.segments, p.closed, ox, oy, paint, p.holes).trimEnd(),
+    );
   }
   body.push("Q");
   const stream = body.join("\n") + "\n";
@@ -299,11 +355,15 @@ export function buildSketchPdf(
   push("\nendstream\n");
   endObj();
 
-  // TrueScale + optional BgRect for round-trip placement.
+  // TrueScale + optional BgRect / Title for round-trip.
   startObj(infoObj);
   let info =
     `<< /Producer (${PDF_PRODUCER}) /Creator (${PDF_PRODUCER}) ` +
     `/TrueScale true /MmPerPx ${fmt(mmPerPx)}`;
+  const title = options.projectName?.trim();
+  if (title) {
+    info += ` /Title ${pdfInfoText(title)}`;
+  }
   if (bgRectContent) {
     info +=
       ` /BgRect [${fmt(bgRectContent.x)} ${fmt(bgRectContent.y)} ` +
@@ -312,8 +372,15 @@ export function buildSketchPdf(
   if (options.stampGapMm != null && Number.isFinite(options.stampGapMm)) {
     info += ` /StampGapMm ${fmt(options.stampGapMm)}`;
   }
-  if (options.stampOutlineEnabled != null) {
-    info += ` /StampOutline ${options.stampOutlineEnabled ? "true" : "false"}`;
+  {
+    const mode =
+      options.stampOutlineMode ??
+      (options.stampOutlineEnabled == null
+        ? null
+        : options.stampOutlineEnabled
+          ? "raised"
+          : "none");
+    if (mode != null) info += ` /StampOutline /${mode}`;
   }
   if (
     options.stampOutlineWidthMm != null &&

@@ -86,6 +86,60 @@ export function simplifyTail(
   path.closed = closed;
 }
 
+export type MeshSampleOpts = {
+  flatness: number;
+  minPerCurve: number;
+  maxPoints: number;
+};
+
+/**
+ * Sampling density for the 3D mesh. Level 2 is the original tessellation;
+ * 1 is coarser, 5 keeps many more points on each curved span.
+ */
+export function meshSampleOpts(
+  quality: number,
+  kind: "outline" | "feature" = "outline",
+): MeshSampleOpts {
+  const q = Math.min(5, Math.max(1, Math.round(quality) || 2));
+  const table: MeshSampleOpts[] = [
+    { flatness: 0.9, minPerCurve: 8, maxPoints: 180 },
+    { flatness: 0.45, minPerCurve: 16, maxPoints: 400 },
+    { flatness: 0.22, minPerCurve: 28, maxPoints: 900 },
+    { flatness: 0.12, minPerCurve: 40, maxPoints: 1600 },
+    { flatness: 0.06, minPerCurve: 56, maxPoints: 2800 },
+  ];
+  const base = table[q - 1];
+  if (kind === "feature") {
+    return {
+      flatness: base.flatness,
+      minPerCurve: Math.max(4, Math.round(base.minPerCurve * 0.5)),
+      maxPoints: Math.round(base.maxPoints * 0.6),
+    };
+  }
+  return base;
+}
+
+/**
+ * How much of that polyline the solid keeps.
+ * Level 2 is the original cutter (0.05 mm / 160 points). Higher levels
+ * keep points that sit closer to the Bézier; 1 is visibly coarser.
+ */
+export function meshFidelity(quality: number): {
+  epsMm: number;
+  maxPts: number;
+  arcMm: number;
+} {
+  const q = Math.min(5, Math.max(1, Math.round(quality) || 2));
+  const table = [
+    { epsMm: 0.45, maxPts: 72, arcMm: 0.5 },
+    { epsMm: 0.05, maxPts: 160, arcMm: 0.15 },
+    { epsMm: 0.018, maxPts: 480, arcMm: 0.05 },
+    { epsMm: 0.007, maxPts: 1000, arcMm: 0.02 },
+    { epsMm: 0.0025, maxPts: 2000, arcMm: 0.008 },
+  ];
+  return table[q - 1];
+}
+
 /**
  * Sample a closed (or open) Paper path into polyline points.
  * Straight spans keep only their anchors; curved spans are densely sampled.
@@ -99,6 +153,7 @@ export function samplePathPoints(
   const maxPoints = opts?.maxPoints ?? 400;
 
   const pts: { x: number; y: number }[] = [];
+  const anchorAt: number[] = [];
   const curves = path.curves;
   if (!curves.length) {
     return path.segments.map((s) => ({ x: s.point.x, y: s.point.y }));
@@ -108,6 +163,7 @@ export function samplePathPoints(
     const curve = curves[ci];
     // Real corners / polygonal edges: no extra samples on the chord
     if (curve.isStraight()) {
+      anchorAt.push(pts.length);
       const p0 = curve.point1;
       pts.push({ x: p0.x, y: p0.y });
       if (ci === curves.length - 1 && !path.closed) {
@@ -118,10 +174,12 @@ export function samplePathPoints(
     }
     // Estimate subdivisions from length and flatness; never under-sample a span
     const len = Math.max(curve.length, 1);
-    const byLen = Math.ceil(len / Math.max(flatness * 4, 1));
+    // Floor used to be 1 paper unit, which threw away finer samples.
+    const byLen = Math.ceil(len / Math.max(flatness * 4, 0.2));
     const samples = Math.max(minPerCurve, byLen);
     // Skip last point of each curve (shared with next) except on final open end
     const last = ci === curves.length - 1 && !path.closed ? samples : samples - 1;
+    anchorAt.push(pts.length);
     for (let i = 0; i <= last; i++) {
       const t = i / samples;
       const p = curve.getPointAtTime(t);
@@ -130,10 +188,21 @@ export function samplePathPoints(
   }
 
   if (pts.length <= maxPoints) return pts;
-  const out: { x: number; y: number }[] = [];
-  const step = pts.length / maxPoints;
-  for (let i = 0; i < maxPoints; i++) out.push(pts[Math.floor(i * step)]);
-  return out;
+  // Uniform thinning used to skip segment anchors, so a sharp corner vanished
+  // from the offset cutter. Always keep those points.
+  const anchors = anchorAt.filter((i) => i >= 0 && i < pts.length);
+  if (anchors.length >= maxPoints) return anchors.map((i) => pts[i]);
+  const keep = new Set(anchors);
+  const interior: number[] = [];
+  for (let i = 0; i < pts.length; i++) if (!keep.has(i)) interior.push(i);
+  const budget = maxPoints - anchors.length;
+  if (interior.length > 0 && budget > 0) {
+    const step = interior.length / budget;
+    for (let i = 0; i < budget; i++) {
+      keep.add(interior[Math.min(interior.length - 1, Math.floor(i * step))]);
+    }
+  }
+  return [...keep].sort((a, b) => a - b).map((i) => pts[i]);
 }
 
 export function makeSegmentSmooth(seg: PaperSegment, scope: PaperScope) {

@@ -39,16 +39,22 @@ function largest(paths: PathsD): Vec2[] | null {
 }
 
 /** Inset (negative delta) or outset a closed ring. Returns the largest loop. */
-export function offsetClosedClipper(pts: Vec2[], delta: number): Vec2[] | null {
+export function offsetClosedClipper(
+  pts: Vec2[],
+  delta: number,
+  arcTolerance = 0.15,
+  join: JoinType = JoinType.Round,
+  miterLimit = 2,
+): Vec2[] | null {
   if (pts.length < 3 || Math.abs(delta) < 1e-9) return pts.map((p) => ({ ...p }));
   const out = inflatePathsD(
     [toPath(pts)],
     delta,
-    JoinType.Round,
+    join,
     EndType.Polygon,
+    miterLimit,
     2,
-    2,
-    0.15,
+    arcTolerance,
   );
   return largest(out);
 }
@@ -70,6 +76,27 @@ export function rimAnnulus(outline: Vec2[], width: number): Vec2[][] {
   return rings
     .filter((p) => p.length >= 3 && Math.abs(areaD(p)) > 1e-4)
     .map(fromPath);
+}
+
+/**
+ * Paper-space stamp rim loops: plate edge (outer) inset from the cutter by
+ * wall/2 + gap, and the inner edge of the raised rim band.
+ */
+export function stampRimLoopsPx(
+  cutterPts: Vec2[],
+  wallMm: number,
+  gapMm: number,
+  outlineWidthMm: number,
+  mmPerPx: number,
+): { outer: Vec2[]; inner: Vec2[] } | null {
+  if (cutterPts.length < 3 || mmPerPx <= 1e-9) return null;
+  const insetPx = (wallMm / 2 + Math.max(0, gapMm)) / mmPerPx;
+  const outer = offsetClosedClipper(cutterPts, -insetPx);
+  if (!outer || outer.length < 3) return null;
+  const wPx = Math.max(0.05, outlineWidthMm) / mmPerPx;
+  const inner = offsetClosedClipper(outer, -wPx);
+  if (!inner || inner.length < 3) return null;
+  return { outer, inner };
 }
 
 /**
@@ -137,18 +164,24 @@ export function featureFootprints(
   const clip = [toPath(outline)];
   let shapes: PathsD;
   if (filled && closed && pts.length >= 3) {
-    // Solid pad — inflate slightly so the edge reads like the canvas stroke
-    const pad = inflatePathsD(
-      [toPath(pts)],
-      halfWidth,
-      JoinType.Round,
-      EndType.Polygon,
-      2,
-      2,
-      ROUND_ARC_TOL,
-    );
-    shapes = pad.length ? pad : [toPath(pts)];
+    if (halfWidth <= 1e-9) {
+      // Hairline width: filled region with no border inflation
+      shapes = [toPath(pts)];
+    } else {
+      // Solid pad — inflate slightly so the edge reads like the canvas stroke
+      const pad = inflatePathsD(
+        [toPath(pts)],
+        halfWidth,
+        JoinType.Round,
+        EndType.Polygon,
+        2,
+        2,
+        ROUND_ARC_TOL,
+      );
+      shapes = pad.length ? pad : [toPath(pts)];
+    }
   } else {
+    if (halfWidth <= 1e-9) return [];
     shapes = strokePolygons(pts, closed, halfWidth);
   }
   if (!shapes.length) return [];

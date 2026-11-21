@@ -14,6 +14,8 @@ export type ImportedSeg = {
 export type ImportedPath = {
   closed: boolean;
   segments: ImportedSeg[];
+  /** Extra closed rings (holes) for even-odd fills — e.g. stamp rim annulus. */
+  holes?: ImportedSeg[][];
   /** Stroke RGB 0–1 when known (PDF import / our export). */
   strokeRgb?: [number, number, number];
   /** True when the path was filled (or fill+stroke). */
@@ -23,12 +25,34 @@ export type ImportedPath = {
   /** Classified stamp role (set by our PDF round-trip / color heuristic). */
   role?: "cutter" | "feature";
   raised?: boolean;
+  /** Cuts raised and recessed marks in this area. */
+  hole?: boolean;
   widthMm?: number;
+  /** Raised plate-edge rim — visual only; rebuilt from StampOutline on import. */
+  stampRim?: boolean;
+  /**
+   * Drawn stamp-outline curve (outer edge of the raised rim).
+   * The cutter is rebuilt around it on import; old PDFs omit this.
+   */
+  stampPlate?: boolean;
 };
 
 /** Raised stamp red / recessed stamp blue used in our PDF export. */
 export const STAMP_RAISE_RGB: [number, number, number] = [0.498, 0.114, 0.114];
 export const STAMP_RECESS_RGB: [number, number, number] = [0.118, 0.227, 0.541];
+/**
+ * Raised rim annulus along the stamp plate edge.
+ * Distinct from feature red so import can skip it (rim is rebuilt from
+ * /StampOutline metadata) while Inkscape still shows a red fill.
+ */
+export const STAMP_RIM_RGB: [number, number, number] = [0.62, 0.16, 0.16];
+/**
+ * Authoritative stamp-outline curve (stamp drawn first).
+ * Far from black, feature red, and rim red so older PDFs stay cutters.
+ */
+export const STAMP_PLATE_RGB: [number, number, number] = [0.05, 0.42, 0.38];
+/** Hole cut out of raised and recessed marks. Purple, away from red/blue/plate. */
+export const STAMP_HOLE_RGB: [number, number, number] = [0.36, 0.2, 0.55];
 
 function colorDist(
   a: [number, number, number],
@@ -43,10 +67,25 @@ function colorDist(
 /** Classify a stroke color: reds → raised, blues → recessed, else cutter. */
 export function classifyStampColor(
   rgb: [number, number, number] | undefined,
-): { role: "cutter" | "feature"; raised: boolean } {
+): {
+  role: "cutter" | "feature";
+  raised: boolean;
+  hole?: boolean;
+  stampRim?: boolean;
+  stampPlate?: boolean;
+} {
   if (!rgb) return { role: "cutter", raised: true };
   const [r, g, b] = rgb;
   // Exact / near matches for our own export colors first
+  if (colorDist(rgb, STAMP_HOLE_RGB) < 0.12) {
+    return { role: "feature", raised: true, hole: true };
+  }
+  if (colorDist(rgb, STAMP_PLATE_RGB) < 0.08) {
+    return { role: "cutter", raised: true, stampPlate: true };
+  }
+  if (colorDist(rgb, STAMP_RIM_RGB) < 0.12) {
+    return { role: "feature", raised: true, stampRim: true };
+  }
   if (colorDist(rgb, STAMP_RAISE_RGB) < 0.18) {
     return { role: "feature", raised: true };
   }
@@ -156,6 +195,8 @@ function parsePdfContent(content: string): ImportedPath[] {
 
   const results: ImportedPath[] = [];
   let build: PathBuild = { segs: [], closed: false, cur: null, start: null };
+  /** Completed subpaths waiting for a paint op (supports even-odd holes). */
+  let rings: { segs: ImportedSeg[]; closed: boolean }[] = [];
   let ctm: M = [1, 0, 0, 1, 0, 0];
   const stack: M[] = [];
   let strokeRgb: [number, number, number] = [0, 0, 0];
@@ -177,23 +218,50 @@ function parsePdfContent(content: string): ImportedPath[] {
     a[1] * b[4] + a[3] * b[5] + a[5],
   ];
 
+  const cloneSegs = (segs: ImportedSeg[]) =>
+    segs.map((s) => ({
+      point: { ...s.point },
+      handleIn: { ...s.handleIn },
+      handleOut: { ...s.handleOut },
+    }));
+
+  const pushRing = () => {
+    if (build.segs.length < 2) return;
+    rings.push({
+      segs: cloneSegs(build.segs),
+      closed: build.closed,
+    });
+    build = { segs: [], closed: false, cur: null, start: null };
+  };
+
   const flush = (closed: boolean, filled: boolean) => {
-    if (build.segs.length >= 2) {
-      const cls = classifyStampColor(strokeRgb);
-      results.push({
-        closed: closed || build.closed,
-        segments: build.segs.map((s) => ({
-          point: { ...s.point },
-          handleIn: { ...s.handleIn },
-          handleOut: { ...s.handleOut },
-        })),
-        strokeRgb: [...strokeRgb] as [number, number, number],
-        filled,
-        strokePt,
-        role: cls.role,
-        raised: cls.raised,
-      });
+    pushRing();
+    if (!rings.length) {
+      build = { segs: [], closed: false, cur: null, start: null };
+      return;
     }
+    const outer = rings[0];
+    const holeRings = rings.slice(1).filter((r) => r.segs.length >= 2);
+    const cls = classifyStampColor(strokeRgb);
+    const isRim =
+      !!cls.stampRim ||
+      (filled && holeRings.length > 0 && cls.role === "feature" && cls.raised);
+    results.push({
+      closed: closed || outer.closed,
+      segments: outer.segs,
+      holes:
+        holeRings.length > 0
+          ? holeRings.map((r) => r.segs)
+          : undefined,
+      strokeRgb: [...strokeRgb] as [number, number, number],
+      filled,
+      strokePt,
+      role: cls.role,
+      raised: cls.raised,
+      stampRim: isRim || undefined,
+      stampPlate: cls.stampPlate || undefined,
+    });
+    rings = [];
     build = { segs: [], closed: false, cur: null, start: null };
   };
 
@@ -238,8 +306,8 @@ function parsePdfContent(content: string): ImportedPath[] {
       const a = need(2);
       if (!a) continue;
       const p = apply({ x: a[0], y: a[1] });
-      // New subpath — keep prior geometry if we already have a shape
-      if (build.segs.length >= 2) flush(build.closed, false);
+      // New subpath — park the prior ring (outer/hole) until paint
+      if (build.segs.length >= 2) pushRing();
       build.segs = [emptySeg(p)];
       build.cur = p;
       build.start = p;
@@ -288,7 +356,7 @@ function parsePdfContent(content: string): ImportedPath[] {
     } else if (op === "re") {
       const a = need(4);
       if (!a) continue;
-      if (build.segs.length >= 2) flush(false, false);
+      if (build.segs.length >= 2) pushRing();
       const [x, y, w, h] = a;
       const pts = [
         apply({ x, y }),
@@ -316,6 +384,7 @@ function parsePdfContent(content: string): ImportedPath[] {
     ) {
       const paintClosed =
         build.closed ||
+        rings.some((r) => r.closed) ||
         op === "s" ||
         op === "f" ||
         op === "f*" ||
@@ -334,6 +403,7 @@ function parsePdfContent(content: string): ImportedPath[] {
         op === "b*";
       flush(paintClosed, filled);
     } else if (op === "n") {
+      rings = [];
       build = { segs: [], closed: false, cur: null, start: null };
       nums.length = 0;
     } else {
@@ -493,11 +563,88 @@ export type PdfImportResult = {
   background: PdfBackground | null;
   /** Fit gap from `/StampGapMm` when present. */
   stampGapMm: number | null;
-  /** Raised outline from `/StampOutline` when present. */
-  stampOutlineEnabled: boolean | null;
+  /** Outline mode from `/StampOutline` when present. */
+  stampOutlineMode: "raised" | "none" | "recessed" | null;
   /** Outline rim width from `/StampOutlineWidthMm` when present. */
   stampOutlineWidthMm: number | null;
+  /** Project title from PDF `/Title` when present (Unicode). */
+  projectName: string | null;
 };
+
+/** Decode a PDF Info text string: hex `<FEFF…>` (UTF-16BE) or literal `(…)`. */
+function decodePdfInfoText(raw: string): string | null {
+  const s = raw.trim();
+  if (s.startsWith("<") && s.endsWith(">")) {
+    const hex = s.slice(1, -1).replace(/\s+/g, "");
+    if (hex.length < 2 || hex.length % 2 !== 0) return null;
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+      const n = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+      if (!Number.isFinite(n)) return null;
+      bytes[i] = n;
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+      let out = "";
+      for (let i = 2; i + 1 < bytes.length; i += 2) {
+        const unit = (bytes[i] << 8) | bytes[i + 1];
+        out += String.fromCharCode(unit);
+      }
+      return out;
+    }
+    return new TextDecoder("latin1").decode(bytes);
+  }
+  if (s.startsWith("(") && s.endsWith(")")) {
+    let out = "";
+    const body = s.slice(1, -1);
+    for (let i = 0; i < body.length; i++) {
+      const ch = body[i];
+      if (ch !== "\\") {
+        out += ch;
+        continue;
+      }
+      const n = body[i + 1];
+      if (n === "n") {
+        out += "\n";
+        i++;
+      } else if (n === "r") {
+        out += "\r";
+        i++;
+      } else if (n === "t") {
+        out += "\t";
+        i++;
+      } else if (n === "(" || n === ")" || n === "\\") {
+        out += n;
+        i++;
+      } else if (n >= "0" && n <= "7") {
+        let oct = n;
+        i++;
+        for (let k = 0; k < 2 && i + 1 < body.length; k++) {
+          const d = body[i + 1];
+          if (d < "0" || d > "7") break;
+          oct += d;
+          i++;
+        }
+        out += String.fromCharCode(parseInt(oct, 8));
+      } else if (n != null) {
+        out += n;
+        i++;
+      }
+    }
+    return out;
+  }
+  return null;
+}
+
+/** `/Title` written by our exporter (UTF-16BE hex or literal). */
+export function pdfProjectName(data: Uint8Array): string | null {
+  const text = new TextDecoder("latin1").decode(data);
+  const m = text.match(/\/Title\s*(<(?:[0-9A-Fa-f\s]+)>|\((?:\\.|[^\\)])*\))/);
+  if (!m) return null;
+  const decoded = decodePdfInfoText(m[1]);
+  if (!decoded) return null;
+  const cleaned = decoded.replace(/[\u0000-\u001f]+/g, "").replace(/\s+/g, " ").trim();
+  return cleaned ? cleaned.slice(0, 120) : null;
+}
 
 /** `/StampGapMm` written by our exporter. */
 export function pdfStampGapMm(data: Uint8Array): number | null {
@@ -510,12 +657,18 @@ export function pdfStampGapMm(data: Uint8Array): number | null {
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
-/** `/StampOutline true|false` written by our exporter. */
-export function pdfStampOutlineEnabled(data: Uint8Array): boolean | null {
+/** `/StampOutline /raised|/none|/recessed` or legacy `true|false`. */
+export function pdfStampOutlineMode(
+  data: Uint8Array,
+): "raised" | "none" | "recessed" | null {
   const text = new TextDecoder("latin1").decode(data);
-  const m = text.match(/\/StampOutline\s+(true|false)/i);
-  if (!m) return null;
-  return m[1].toLowerCase() === "true";
+  const named = text.match(/\/StampOutline\s+\/?(raised|none|recessed)\b/i);
+  if (named) {
+    return named[1].toLowerCase() as "raised" | "none" | "recessed";
+  }
+  const legacy = text.match(/\/StampOutline\s+(true|false)/i);
+  if (!legacy) return null;
+  return legacy[1].toLowerCase() === "true" ? "raised" : "none";
 }
 
 /** `/StampOutlineWidthMm` written by our exporter. */
@@ -633,8 +786,9 @@ export async function pathsFromPdf(data: Uint8Array): Promise<PdfImportResult> {
     mmPerPx,
     background,
     stampGapMm: pdfStampGapMm(data),
-    stampOutlineEnabled: pdfStampOutlineEnabled(data),
+    stampOutlineMode: pdfStampOutlineMode(data),
     stampOutlineWidthMm: pdfStampOutlineWidthMm(data),
+    projectName: pdfProjectName(data),
   };
 }
 
